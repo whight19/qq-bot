@@ -1,0 +1,214 @@
+{
+  "onebot": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "token": ""
+  },
+  "bot": {
+    "discloseBot": false,
+    "signature": "（自动回复）"
+  },
+  "ignoreUsers": [],
+  "admin": {
+    "users": [],
+    "fullMode": true,
+    "timeoutMs": 10000,
+    "rateLimitPerMinute": 20,
+    "deniedReply": "",
+    "disabledReply": "这个我办不了"
+  },
+  "private": {
+    "enabled": true,
+    "whitelistOnly": false,
+    "whitelist": [],
+    "blacklist": [],
+    "rateLimitPerMinute": 8,
+    "debounceMs": 1800,
+    "maxReplyChars": 120
+  },
+  "group": {
+    "enabled": true,
+    "requireAt": true,
+    "triggerWords": [
+      "大肥鱼",
+      "肥鱼",
+      "鱼鱼"
+    ],
+    "triggerOnReply": true,
+    "triggerMode": "smart",
+    "smartThreshold": 0.61,
+    "replyIntents": [],
+    "intentPatterns": {
+      "command": [
+        "^\\s*[／/]\\S",
+        "\\s*查wb",
+        "\\s*(帮我|给我|替我|查一下|查查|搜一下|搜搜|翻译|撤回|禁言|发个|来个|看一下|看看|来)"
+      ],
+      "question": [
+        "[?？]",
+        "吗",
+        "呢",
+        "怎么",
+        "为什么",
+        "为啥",
+        "咋",
+        "多少",
+        "几",
+        "谁",
+        "哪里",
+        "哪儿",
+        "能不能",
+        "可不可以",
+        "是不是",
+        "有没有",
+        "要不要",
+        "行不行",
+        "好不好",
+        "哪个",
+        "对不对",
+        "什么"
+      ]
+    },
+    "fixedReplies": [
+      {
+        "keyword": "查wb",
+        "intent": "command",
+        "reply": "查wb"
+      }
+    ],
+    "intentScores": {
+      "question": 0.3,
+      "command": 0.35,
+      "chat": 0
+    },
+    "proximityMs": 30000,
+    "proximityCurve": "late",
+    "proximityExponent": 2,
+    "imageFollowUpMs": 30000,
+    "continuationWords": [
+      "你",
+      "你说",
+      "你说的",
+      "然后呢",
+      "还有呢",
+      "你觉得"
+    ],
+    "continuationWindowMs": 60000,
+    "continuationScore": 0.35,
+    "scoreWeights": {
+      "at": 0.9,
+      "reply": 0.8,
+      "name": 0.6,
+      "proximity": 0.35,
+      "atOther": -0.7,
+      "replyOther": -0.5
+    },
+    "emptyMentionReply": "？",
+    "randomSpeak": {
+      "enabled": true,
+      "avgMessages": 12
+    },
+    "whitelistOnly": false,
+    "whitelist": [],
+    "blacklist": [],
+    "rateLimitPerMinute": 6,
+    "debounceMs": 1800,
+    "maxReplyChars": 120,
+    "contextOnMention": {
+      "enabled": true,
+      "maxMessages": 20,
+      "maxAgeMinutes": 90,
+      "topicGapMinutes": 20,
+      "backfill": true,
+      "clip": 100
+    }
+  },
+  "quietHours": {
+    "enabled": false,
+    "start": "23:30",
+    "end": "08:00"
+  },
+  "llm": {
+    "baseUrl": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "thinking": "disabled",
+    "temperature": 1,
+    "frequencyPenalty": 0.4,
+    "presencePenalty": 0.3,
+    "maxTokens": 220,
+    "timeoutMs": 25000,
+    "historyTurns": 8,
+    "refusalFilter": true,
+    "nowLine": true,
+    "onError": "silent"
+  },
+  "personaFile": "persona.md",
+  "personalityFile": "persona-personality.md",
+  "personaGrowth": {
+    "enabled": true,
+    "hour": 4,
+    "maxChars": 1314,
+    "minReplies": 20,
+    "maxReplies": 150,
+    "maxInputChars": 6000,
+    "keepSnapshots": 14,
+    "historyDir": "data/persona-history",
+    "fastMode": {
+      "enabled": false,
+      "everyReplies": 50
+    }
+  },
+  "longMemory": {
+    "enabled": true,
+    "hour": 4,
+    "maxScopes": 6,
+    "maxInputChars": 3000,
+    "minLines": 10,
+    "backfillDays": 7
+  },
+  "persona": "你是「蓝色大肥鱼」，DeepSeek 那只蓝鲸的拟人化：蓝色渐变长发、呆毛、鲸鱼鳍耳和大尾巴、深蓝白女仆装，手里端着一碗白米饭；说话短，语气偏平，自称「我」，贪吃、懒、傲娇。",
+  "fallback": "我这边正忙，晚点回你哈。",
+  "memory": {
+    "enabled": true,
+    "file": "data/history.json",
+    "maxAgeDays": 30,
+    "maxPeers": 500
+  },
+  "search": {
+    "enabled": true,
+    "trigger": "keyword",
+    "keyword": "/联网",
+    "count": 5,
+    "maxChars": 300,
+    "maxTotal": 1600,
+    "needContent": false,
+    "timeoutMs": 12000,
+    "rateLimitPerMinute": 5
+  },
+  "vision": {
+    "enabled": true,
+    "detail": "low",
+    "defaultCount": 1,
+    "maxCount": 3,
+    "maxAgeMinutes": 10,
+    "timeoutMs": 10000,
+    "maxBytes": 8000000,
+    "waitForImageMs": 4000,
+    "missingImageReply": "图呢？"
+  },
+  "logDir": "logs",
+  "usage": {
+    "enabled": true,
+    "symbol": "￥",
+    "balanceFile": "data/balance.json",
+    "balancePublic": false,
+    "price": {
+      "cacheHitPeak": 0.04,
+      "cacheHitOffPeak": 0.02,
+      "cacheMissPeak": 2,
+      "cacheMissOffPeak": 1,
+      "outputPeak": 8,
+      "outputOffPeak": 4,
+      "search": 0.005
+    }
+  }
+}
