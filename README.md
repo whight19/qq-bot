@@ -697,6 +697,9 @@ node D:\qq-bot\bot.mjs --selftest
 
 ## 长期记忆（画像 + 事件召回）
 
+长期记忆功能参考了https://github.com/Yuuyuko-uu/dsh-fish-memory.git
+特此感谢！
+
 短期记忆（上面的 transcript）只记得最近十几轮；再往前的事交给长期记忆。它分两层，放的位置不一样：
 
 ```
