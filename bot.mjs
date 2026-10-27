@@ -194,6 +194,7 @@ const rate = new Map();    // bucketKey -> number[]
 const queues = new Map();  // peerKey -> { ctx, texts, timer }
 const busyPeers = new Set(); // peerKey -> 这一轮 respond 还在跑（同一会话不并发调模型）
 const lastTriggerAt = new Map(); // peerKey -> 上次被触发的时间
+const POKE_EVENT_TEXT = '（戳了戳你）';
 
 /* ---------------------------------------------------------------- 工具函数 */
 
@@ -368,7 +369,16 @@ function handlePayload(raw) {
     return;
   }
 
-  if (data.post_type === 'message') handleMessageEvent(data);
+  if (data.post_type === 'message') {
+    handleMessageEvent(data);
+    return;
+  }
+
+  if (data.post_type === 'notice' && isPokeNotice(data)) {
+    handlePokeEvent(data).catch((err) =>
+      log({ kind: 'poke_error', error: String(err?.message || err) }),
+    );
+  }
 }
 
 function connect() {
@@ -495,6 +505,7 @@ let liveCfg = {
   emptyMentionReply: null,
   fixedReplies: null,
   randomSpeak: null,
+  poke: null,
   personaGrowth: null,
   admin: null,
   usage: null,
@@ -531,6 +542,8 @@ function liveConfig() {
         fixedReplies: Array.isArray(fresh.group?.fixedReplies) ? fresh.group.fixedReplies : null,
         // 随机插话的频率也热加载
         randomSpeak: fresh.group?.randomSpeak && typeof fresh.group.randomSpeak === 'object' ? fresh.group.randomSpeak : null,
+        // 戳一戳开关、限流和冷却也热加载
+        poke: fresh.poke && typeof fresh.poke === 'object' ? fresh.poke : null,
         // 性格成长的参数（上限/频率/目录）也热加载，改完下一条消息生效
         personaGrowth: fresh.personaGrowth && typeof fresh.personaGrowth === 'object' ? fresh.personaGrowth : null,
         // 管理员 / 指令开关：整块热加载，改 users 或 fullMode 存盘即生效
@@ -1128,15 +1141,24 @@ async function buildGroupContext(peerKey, groupId, exclude = { userId: '', texts
 
 /* -------------------------------------------------------------- 消息处理 */
 
-function enqueue(ctx, text) {
+function enqueue(ctx, text, type = 'message') {
   const key = ctx.peerKey;
   let queue = queues.get(key);
   if (!queue) {
-    queue = { ctx, texts: [], timer: null };
+    queue = { ctx, items: [], timer: null };
     queues.set(key, queue);
   }
-  queue.ctx = ctx;
-  queue.texts.push(text);
+  // 戳一戳后紧接着又发普通消息时，debounce 会合并成一轮；别让后到的
+  // 普通消息覆盖戳一戳身份，否则模型不知道这段时间里是谁戳了它。
+  const poke = queue.ctx?.poke ?? ctx.poke;
+  queue.ctx = poke && !ctx.poke ? { ...ctx, poke } : ctx;
+  // 一轮里攒的是「条目」，不是纯文本：戳一戳和普通消息要分得开
+  // （纯戳不进长期记忆、不解析指令；混合轮只取普通消息当正文）
+  queue.items.push({
+    type,
+    text,
+    nickname: type === 'poke' ? ctx.nickname : '',
+  });
   // 记下「这个会话刚被触发过」，补发的图片要靠它才进队列
   lastTriggerAt.set(key, Date.now());
 
@@ -1157,24 +1179,231 @@ function drainQueue(key) {
   const queue = queues.get(key);
   if (!queue || queue.timer) return;   // 还在攒（debounce 没到）
   if (busyPeers.has(key)) return;      // 上一轮没跑完，它结束时会再进来
-  if (queue.texts.length === 0) {
+  if (queue.items.length === 0) {
     queues.delete(key);
     return;
   }
   const ctx = queue.ctx;
-  const texts = queue.texts;
-  queue.texts = [];
+  const items = queue.items;
+  queue.items = [];
   busyPeers.add(key);
-  respond({ ctx, texts })
+  respond({ ctx, items })
     .catch((err) => log({ kind: 'respond_error', peer: key, error: String(err?.message || err) }))
     .finally(() => {
       busyPeers.delete(key);
       const next = queues.get(key);
       if (!next) return;
-      if (next.texts.length === 0) queues.delete(key);
+      if (next.items.length === 0) queues.delete(key);
       // 攒着的 debounce 已经到点了才立刻接着跑；还在攒就等它自己的定时器
       else if (!next.timer) drainQueue(key);
     });
+}
+
+/** OneBot v11 标准里 poke 可能是 notice_type=poke，NapCat 目前发的是 notify + sub_type=poke。 */
+function isPokeNotice(event) {
+  return (
+    event?.notice_type === 'poke' ||
+    (event?.notice_type === 'notify' && event?.sub_type === 'poke')
+  );
+}
+
+/**
+ * 戳一戳的专用闸门：用户操作很轻，但连点几下就是几次模型调用；
+ * 所以不跟消息共用限流桶，另外再加一条「同人冷却」。
+ */
+function pokeCfg() {
+  const source = liveCfg.poke && typeof liveCfg.poke === 'object'
+    ? liveCfg.poke
+    : (config.poke && typeof config.poke === 'object' ? config.poke : {});
+  const num = (v, d, min, max) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return d;
+    return Math.min(max, Math.max(min, n));
+  };
+  return {
+    enabled: source.enabled !== false,
+    rateLimitPerMinute: num(source.rateLimitPerMinute, 3, 1, 30),
+    cooldownMs: num(source.cooldownMs, 10000, 0, 300000),
+  };
+}
+
+const lastPokeAt = new Map(); // peerKey -> 上次真的唤醒的时间
+const pokeNameCache = new Map(); // nameKey -> { nickname, at }
+const POKE_CACHE_MAX = 2000;
+const POKE_NAME_TTL_MS = 10 * 60000;
+
+/** 这两张表只做加速，满了就丢最老的，别让它无限长。 */
+function capMap(map, max = POKE_CACHE_MAX) {
+  if (map.size <= max) return;
+  let drop = map.size - max;
+  for (const key of map.keys()) {
+    map.delete(key);
+    if (--drop <= 0) break;
+  }
+}
+
+function pokeNameKey(isGroup, groupId, userId) {
+  return (isGroup ? 'g:' + groupId : 'u') + ':' + userId;
+}
+
+/** 缓存只负责低延迟展示；过期后后台刷新，避免群名片改了还一直叫旧名字。 */
+function cachedPokeName(key, now = Date.now()) {
+  const hit = pokeNameCache.get(key);
+  if (!hit) return '';
+  if (now - hit.at > POKE_NAME_TTL_MS) {
+    pokeNameCache.delete(key);
+    return '';
+  }
+  return hit.nickname;
+}
+
+/** 群戳通常不带群名片/昵称，尽量补查一次；查不到就退回 QQ 号。 */
+async function pokeNickname(event, isGroup) {
+  const userId = toId(event.user_id || event.sender_id);
+  const direct = String(event.sender?.card || event.sender?.nickname || '').trim();
+  if (direct) return direct;
+  const groupId = toId(event.group_id);
+  const cacheKey = pokeNameKey(isGroup, groupId, userId);
+  const cached = cachedPokeName(cacheKey);
+  if (cached) return cached;
+  try {
+    const info = isGroup
+      ? await callAction(
+          'get_group_member_info',
+          { group_id: Number(groupId), user_id: Number(userId), no_cache: false },
+          5000,
+        )
+      : await callAction('get_stranger_info', { user_id: Number(userId), no_cache: false }, 5000);
+    const nickname = String(info?.card || info?.nickname || '').trim();
+    if (nickname) {
+      pokeNameCache.set(cacheKey, { nickname, at: Date.now() });
+      capMap(pokeNameCache);
+      return nickname;
+    }
+  } catch (err) {
+    log({
+      kind: 'poke_sender_lookup_failed',
+      user: userId,
+      group: groupId || null,
+      error: String(err?.message || err),
+    });
+  }
+  return userId;
+}
+
+/**
+ * 戳一戳是“点名”，不参与群聊指代打分；只要戳的是机器人就进模型。
+ * 群/私聊开关、忽略名单、黑白名单、静默时段和限流仍然生效。
+ */
+async function handlePokeEvent(event) {
+  if (!selfId && event.self_id) selfId = event.self_id;
+  // 刚启动那几秒 self_id 可能是 0：补问一次，别把戳静静丢掉
+  if (!selfId) {
+    try {
+      const info = await callAction('get_login_info', {}, 5000);
+      if (info?.user_id) selfId = info.user_id;
+    } catch {
+      /* 问不到就下面跳过 */
+    }
+  }
+  if (!selfId) {
+    log({ kind: 'skip', reason: 'self_id_unknown', poke: true });
+    return;
+  }
+  if (toId(event.target_id) !== toId(selfId)) return;
+
+  liveConfig();
+  const pCfg = pokeCfg();
+  if (!pCfg.enabled) return;
+
+  const userId = toId(event.user_id || event.sender_id);
+  if (!userId || userId === toId(selfId)) return;
+  if (ignoredUsers().has(userId)) {
+    log({ kind: 'skip', reason: 'ignored_user', user: userId, group: event.group_id, poke: true });
+    return;
+  }
+
+  maybeGrowPersonality();
+  maybeUpdateLongMemory();
+
+  if (inQuietHours()) {
+    log({ kind: 'skip', reason: 'quiet_hours', user: userId, group: event.group_id, poke: true });
+    return;
+  }
+
+  const groupId = toId(event.group_id);
+  const isGroup = Boolean(groupId);
+  const cfg = isGroup ? config.group : config.private;
+  if (!cfg || !cfg.enabled) {
+    log({ kind: 'skip', reason: 'disabled', user: userId, group: groupId || null, poke: true });
+    return;
+  }
+  if (!allowed(cfg, isGroup ? groupId : userId)) {
+    log({
+      kind: 'skip',
+      reason: isGroup ? 'group_not_allowed' : 'user_not_allowed',
+      user: userId,
+      group: groupId || null,
+      poke: true,
+    });
+    return;
+  }
+
+  const peerKey = isGroup ? `g:${groupId}:${userId}` : `u:${userId}`;
+
+  // ① 同人冷却：重复戳不占每分钟额度
+  const now = Date.now();
+  const last = lastPokeAt.get(peerKey) ?? 0;
+  if (now - last < pCfg.cooldownMs) {
+    log({ kind: 'skip', reason: 'poke_cooldown', peer: peerKey, sinceMs: now - last });
+    return;
+  }
+  // ② 独立限流（比消息更紧）：防止有人连点戳来刷模型
+  if (!rateAllowed('poke:' + peerKey, pCfg.rateLimitPerMinute)) {
+    log({ kind: 'skip', reason: 'rate_limited', bucket: 'poke', peer: peerKey });
+    return;
+  }
+  lastPokeAt.set(peerKey, now);
+  capMap(lastPokeAt);
+
+  // ③ 昵称不挡回复：先用事件里带的（或缓存），查到了再补
+  const fast = String(event.sender?.card || event.sender?.nickname || '').trim()
+    || cachedPokeName(pokeNameKey(isGroup, groupId, userId))
+    || '';
+  const nickname = fast || userId;
+  const ctx = {
+    kind: isGroup ? 'group' : 'private',
+    userId,
+    groupId,
+    peerKey,
+    nickname,
+    images: [],
+    replyId: '',
+    atSelf: isGroup,
+    cfg,
+    poke: { userId, nickname },
+  };
+
+  log({ kind: 'poke', peer: peerKey, user: userId, nickname, group: groupId || null });
+  enqueue(ctx, POKE_EVENT_TEXT, 'poke');
+
+  if (!fast) {
+    // 后台补名字：debounce 还没到点就能赶上这一轮，赶不上也不影响回复
+    pokeNickname(event, isGroup)
+      .then((name) => {
+        if (!name || name === userId) return;
+        const q = queues.get(peerKey);
+        if (q?.ctx?.poke && q.ctx.poke.userId === userId) {
+          q.ctx.poke.nickname = name;
+          q.ctx.nickname = name;
+          for (const item of q.items ?? []) {
+            if (item.type === 'poke') item.nickname = name;
+          }
+          log({ kind: 'poke_name_filled', peer: peerKey, nickname: name });
+        }
+      })
+      .catch(() => {});
+  }
 }
 
 function handleMessageEvent(event) {
@@ -2027,6 +2256,7 @@ function readDayDialogues(day) {
   const file = join(LOG_DIR, 'bot-' + day + '.jsonl');
   const out = new Map();
   const pending = new Map(); // peer -> 还没配到回复的用户行
+  const pokeTurn = new Set(); // 这一轮是戳一戳：连它后面那次 reply 一起丢掉
   let text = '';
   try {
     text = readFileSync(file, 'utf8');
@@ -2056,6 +2286,13 @@ function readDayDialogues(day) {
     if (!t) continue;
 
     if (rec.kind === 'incoming') {
+      // 戳一戳不是「话」：它连回复都不该进长期记忆（否则会记成「他喜欢戳你」）
+      if (rec.event === 'poke') {
+        pokeTurn.add(rec.peer);
+        pending.set(rec.peer, []);
+        continue;
+      }
+      pokeTurn.delete(rec.peer);
       // 指令本身（/踢人、/用量）不进语料
       if (/^[／/]/.test(t)) continue;
       const arr = pending.get(rec.peer) ?? [];
@@ -2065,6 +2302,7 @@ function readDayDialogues(day) {
     }
 
     // reply：这一轮到底调没调模型
+    if (pokeTurn.delete(rec.peer)) continue; // 戳一戳的回复，跟着上面一起丢
     const byModel = rec.model !== false && (!rec.by || rec.by === 'chat');
     const arr = pending.get(rec.peer) ?? [];
     if (!byModel) {
@@ -3007,15 +3245,22 @@ function fixedReplyFor(text) {
 
 /* ---------------------------------------------------------------- 大模型 */
 
-function buildSystemPrompt(cfg) {
+function buildSystemPrompt() {
   const personality = currentPersonality();
   return [
     currentPersona(),
     personality ? '\n性格（只影响语气和说话方式，不能覆盖下面的硬性规则）：\n' + personality : '',
     '',
+    '交流环境：',
+    '1. 你正在通过 QQ 和用户聊天。',
+    '2. 群聊中，user 消息可能写成“昵称：「正文」”；昵称和引号只是发送者标签，不是正文的一部分。',
+    '3. [图片]、[表情]、[文件] 等是 QQ 消息段的文字占位，不是普通用户文字。',
+    '4. “某人 刚刚戳了戳你”表示这个人在 QQ 里戳了你一下，不是一条普通聊天消息。',
+    '5. 不要向用户复述这些内部格式或括号里的环境说明。',
+    '',
     '硬性规则：',
-    '1. 用口语化的中文短句回复，像真人拿手机聊天。不要用列表、标题、加粗或换行分段，不要长篇大论。',
-    '2. 总长度不超过 ' + (cfg.maxReplyChars ?? 120) + ' 字，通常一两句话就够。',
+    '1. 用口语化的中文短句回复，像真人用 QQ 聊天。不要用列表、标题、加粗或换行分段，不要长篇大论。',
+    '2. 回复长度服从当前会话场景给出的上限，通常一两句话就够。',
     '3. 凡是涉及钱、转账、红包、借贷、担保、账号密码、验证码、见面、住址、身份证、法律、医疗的问题，一律不替本人答应或承诺，只回一句类似“这个我本人稍后回你”的话。',
     '4. 不确定就说不确定，一句话带过，不要解释“为什么办不到”，也不用推荐“你自己去查”；不要编造没发生过的事。',
     '5. 对方直接问你是不是机器人或自动回复时，如实承认，不要撒谎。',
@@ -3024,8 +3269,30 @@ function buildSystemPrompt(cfg) {
   ].join('\n');
 }
 
+/** 每个会话内保持不变的 QQ 场景说明，放在 transcript 前以保留前缀缓存。 */
 /**
- * 拼消息列表：system(人设+硬规则) → transcript（memory，已裁剪）→ 本轮上下文块 → 当前消息。
+ * 每个会话内保持不变的 QQ 场景说明，放在 transcript 前以保留前缀缓存。
+ * 硬性规则 2 现在只说「服从本会话上限」，所以**这里必须永远给出一个上限** ——
+ * 认不出会话类型时也得给，别让那条规则悬空。
+ */
+function sessionSurfaceBlock(peerKey, cfg) {
+  const key = String(peerKey ?? '');
+  const limit = Number(cfg?.maxReplyChars ?? 120);
+  const lengthRule = Number.isFinite(limit) && limit > 0
+    ? `本会话回复总长度不超过 ${limit} 字。`
+    : '回复保持简短，通常一两句话。';
+  if (key.startsWith('u:')) {
+    return '（当前会话：QQ 私聊。user 消息是对方直接对你说的话。' + lengthRule + '）';
+  }
+  if (key.startsWith('g:')) {
+    return '（当前会话：QQ 群聊。你看到的是群成员的发言和最近的群聊上下文；回复要面向当前说话人，同时让其他群成员也能自然接上。' + lengthRule + '）';
+  }
+  // 兜底：会话类型认不出来也别让长度规则消失
+  return '（当前会话：QQ 聊天。' + lengthRule + '）';
+}
+
+/**
+ * 拼消息列表：system(人设+QQ环境+硬规则) → 会话场景 → 画像 → transcript → 本轮上下文 → 当前消息。
  * transcript 只追加不改写，所以上一次请求天然是这一次的前缀，缓存命中率才高。
  */
 function buildMessageList(cfg, peerKey, userText, extraBlocks = [], imageParts = []) {
@@ -3041,7 +3308,9 @@ function buildMessageList(cfg, peerKey, userText, extraBlocks = [], imageParts =
     }
   }
 
-  const messages = [{ role: 'system', content: buildSystemPrompt(cfg) }];
+  const messages = [{ role: 'system', content: buildSystemPrompt() }];
+  const surface = sessionSurfaceBlock(peerKey, cfg);
+  if (surface) messages.push({ role: 'system', content: surface });
 
   // 长期画像：一天只变一次，所以放在 transcript **之前** —— 能吃到前缀缓存。
   // （事件召回是每轮按这句话变的，放在 transcript 之后，见 respond。）
@@ -3354,7 +3623,31 @@ async function sendReply(ctx, text, by = 'chat') {
 
 async function respond(queue) {
   const ctx = queue.ctx;
-  const userText = queue.texts.join('\n').trim();
+  // 正常路径由 drainQueue 传 items；自测里会直接 respond({ ctx, texts })，
+  // 所以这里保留 texts → items 的降级。
+  const texts = Array.isArray(queue.texts) ? queue.texts : [];
+  const items = Array.isArray(queue.items) && queue.items.length > 0
+    ? queue.items
+    : texts.map((text) => ({
+        type: ctx.poke && text === POKE_EVENT_TEXT ? 'poke' : 'message',
+        text,
+        nickname: ctx.nickname,
+      }));
+  const messageTexts = items
+    .filter((item) => item.type === 'message')
+    .map((item) => String(item.text ?? '').trim())
+    .filter(Boolean);
+  const pokeItems = items.filter((item) => item.type === 'poke');
+  const hasPoke = pokeItems.length > 0 || Boolean(ctx.poke);
+  const isPokeOnly = items.length > 0 && pokeItems.length === items.length;
+  const pokeMeta = ctx.poke ?? {
+    userId: ctx.userId,
+    nickname: pokeItems.at(-1)?.nickname || ctx.nickname || ctx.userId,
+  };
+  // 纯戳一戳时 messageTexts 是空的，还得靠 items 里的占位文本兜一下，
+  // 否则 userText 会被判成空、整轮直接 return（戳了等于没戳）。
+  const itemTexts = items.map((item) => String(item.text ?? '').trim()).filter(Boolean);
+  const userText = (messageTexts.length > 0 ? messageTexts : itemTexts).join('\n').trim();
   if (!userText) return;
 
   if (!rateAllowed(ctx.peerKey + ':rl', ctx.cfg.rateLimitPerMinute)) {
@@ -3362,13 +3655,19 @@ async function respond(queue) {
     return;
   }
 
-  log({ kind: 'incoming', peer: ctx.peerKey, nickname: ctx.nickname, text: userText });
+  log({
+    kind: 'incoming',
+    peer: ctx.peerKey,
+    nickname: ctx.nickname,
+    text: userText,
+    event: isPokeOnly ? 'poke' : (hasPoke ? 'poke_message' : 'message'),
+  });
 
   // 指令优先：整条以 /指令 开头，或句中任意位置出现通用指令（/联网 这类）。
   // 只看**第一条**消息 —— debounce 会把连发的几条拼起来，不能让后一句闲聊变成 /禁言 的参数。
-  const firstText = queue.texts[0] ?? userText;
-  let commandHit = parseCommand(firstText);
-  if (!commandHit) commandHit = findPublicCommand(firstText);
+  const firstText = messageTexts[0] ?? userText;
+  let commandHit = isPokeOnly ? null : parseCommand(firstText);
+  if (!commandHit && !isPokeOnly) commandHit = findPublicCommand(firstText);
   let searchHit = null;
   if (commandHit) {
     const isPublic = commandHit.command.public === true;
@@ -3396,7 +3695,7 @@ async function respond(queue) {
   }
 
   // 固定回复：群聊里「含关键字 + 意图命中」就直接回预设句子，不调模型
-  if (ctx.kind === 'group') {
+  if (!isPokeOnly && ctx.kind === 'group') {
     const fixed = fixedReplyFor(userText);
     if (fixed) {
       log({ kind: 'fixed_reply', peer: ctx.peerKey, keyword: fixed.keyword, intent: fixed.intent, text: fixed.reply });
@@ -3415,17 +3714,28 @@ async function respond(queue) {
   // 时间锚：放最前面（背景信息），离当前消息远一点，不干扰指代
   if (config.llm?.nowLine !== false) extraBlocks.push(nowLine());
 
+  // 戳一戳如果和普通消息一起被 debounce 合并，普通提示词里会丢掉“戳”这个动作；
+  // 单独补一块，并明确写出是谁戳的。纯戳一戳则直接放在最后一条 user 消息里。
+  // 这块会被写进 transcript（persistBlocks 只排除搜索和召回），所以下一轮
+  // 模型仍然知道「刚才他戳过我」—— 不用再往 user 文本里塞 [戳] 前缀。
+  if (hasPoke && !isPokeOnly) {
+    const by = String(pokeMeta.nickname || pokeMeta.userId || '').trim();
+    extraBlocks.push(
+      `（刚刚是 ${by} 戳了戳你；这不是一条文字消息，请把这件事也自然地带进回复。）`,
+    );
+  }
+
   // 事件召回：按这句话挑最多 2 条旧事。放最前面（离当前消息最远），
   // 因为「这个/那个」的先行词在群上下文里，群上下文得紧贴 user 消息。
   // 带上最近几轮原文，用来剔掉「对话里已经更新过」的旧事实。
   const recentText = recentSpeech(ctx.peerKey);
-  const memBlock = recallBlock(ctx.peerKey, userText, recentText);
+  const memBlock = isPokeOnly ? '' : recallBlock(ctx.peerKey, userText, recentText);
   if (memBlock) extraBlocks.push(memBlock);
 
   if (ctx.kind === 'group') {
     try {
       // 插话轮不剔除触发消息：让它作为「群里刚说的最后一条」留在上下文块里
-      const excludeCtx = ctx.bargedIn ? { userId: '', texts: [] } : { userId: ctx.userId, texts: queue.texts };
+      const excludeCtx = ctx.bargedIn ? { userId: '', texts: [] } : { userId: ctx.userId, texts: messageTexts };
       groupBlock = await buildGroupContext(ctx.peerKey, ctx.groupId, excludeCtx);
       if (groupBlock) extraBlocks.push(groupBlock);
     } catch (err) {
@@ -3456,7 +3766,7 @@ async function respond(queue) {
     }
     textForModel = query;
     searchQuery = query;
-  } else if (shouldSearch(userText, sCfg)) {
+  } else if (!isPokeOnly && shouldSearch(userText, sCfg)) {
     // 老路子（trigger=keyword/smart/always）保留：消息里带触发词也照样搜
     // 去掉「/联网」再交给模型；只发了触发词就保留原文，让它反问要搜什么
     const cleaned = stripSearchKeyword(userText, sCfg);
@@ -3495,7 +3805,9 @@ async function respond(queue) {
   //                否则模型会把它当成「有人对我提要求」，逐字硬答。
   const speaker = ctx.nickname || ctx.userId;
   let promptUserText = textForModel;
-  if (ctx.bargedIn) {
+  if (isPokeOnly) {
+    promptUserText = speaker + ' 刚刚戳了戳你';
+  } else if (ctx.bargedIn) {
     // 插话轮：触发消息留在上面的上下文块里（不进 user 角色），user 只放一句指令，
     // 否则模型会把它当成「有人对我提要求」，逐字硬答。
     extraBlocks.push(
@@ -3651,6 +3963,12 @@ async function runSelfTest() {
             break;
           case 'get_group_member_list':
             data = memberList;
+            break;
+          case 'get_group_member_info':
+            data = memberList.find((m) => String(m.user_id) === String(req.params.user_id)) ?? {};
+            break;
+          case 'get_stranger_info':
+            data = { user_id: req.params.user_id, nickname: '小明' };
             break;
           case 'send_group_msg':
             data = { message_id: 999 };
@@ -4016,6 +4334,275 @@ async function runSelfTest() {
       globalThis.fetch = originalFetch;
     }
   };
+  const withPokeCfg = async (cfg, fn) => {
+    const prevConfig = config.poke;
+    const prevLive = liveCfg.poke;
+    config.poke = cfg;
+    liveCfg.poke = cfg;
+    try {
+      return await fn();
+    } finally {
+      config.poke = prevConfig;
+      liveCfg.poke = prevLive;
+    }
+  };
+
+  await asyncTest('戳一戳：群内必定唤醒，并把戳人者昵称告诉模型', async () => {
+    const originalDebounce = config.group.debounceMs;
+    const originalContext = liveCfg.groupContext;
+    config.group.debounceMs = 5;
+    liveCfg.groupContext = { enabled: false };
+    const peer = 'g:9820:222222';
+    memory.delete(peer);
+    try {
+      mockOneBot();
+      await withModelStub(async (bodies) => {
+        handlePayload(JSON.stringify({
+          post_type: 'notice',
+          notice_type: 'notify',
+          sub_type: 'poke',
+          self_id: 999999,
+          group_id: 9820,
+          user_id: 222222,
+          target_id: 999999,
+        }));
+        await sleep(150);
+        assert(bodies.length === 1, '戳一戳没有唤醒模型：' + bodies.length);
+        const last = bodies[0].messages.at(-1);
+        assert(last?.role === 'user', JSON.stringify(last));
+        assert(last.content.includes('小明') && last.content.includes('戳了戳你'), JSON.stringify(last.content));
+      });
+      assert(actionsRun().includes('get_group_member_info'), '没查戳人者的群昵称');
+      assert(actionsRun().includes('send_group_msg'), '没在群里回复戳一戳');
+    } finally {
+      config.group.debounceMs = originalDebounce;
+      liveCfg.groupContext = originalContext;
+      memory.delete(peer);
+    }
+  });
+
+  await asyncTest('戳一戳：只响应目标为本机的通知', async () => {
+    const originalDebounce = config.group.debounceMs;
+    config.group.debounceMs = 5;
+    try {
+      mockOneBot();
+      await withModelStub(async (bodies) => {
+        handlePayload(JSON.stringify({
+          post_type: 'notice',
+          notice_type: 'poke',
+          self_id: 999999,
+          group_id: 9821,
+          user_id: 222222,
+          target_id: 333333,
+        }));
+        await sleep(120);
+        assert(bodies.length === 0, '戳别人也调用了模型');
+      });
+      assert(calls.length === 0, '戳别人不该产生任何 OneBot 动作：' + actionsRun().join(','));
+    } finally {
+      config.group.debounceMs = originalDebounce;
+    }
+  });
+
+  await asyncTest('戳一戳：私聊也会唤醒，并带上戳人者身份', async () => {
+    const originalDebounce = config.private.debounceMs;
+    config.private.debounceMs = 5;
+    const peer = 'u:222222';
+    memory.delete(peer);
+    try {
+      mockOneBot();
+      await withModelStub(async (bodies) => {
+        handlePayload(JSON.stringify({
+          post_type: 'notice',
+          notice_type: 'notify',
+          sub_type: 'poke',
+          self_id: 999999,
+          user_id: 222222,
+          target_id: 999999,
+        }));
+        await sleep(150);
+        assert(bodies.length === 1, '私聊戳一戳没有唤醒模型：' + bodies.length);
+        const last = bodies[0].messages.at(-1);
+        assert(last?.role === 'user', JSON.stringify(last));
+        assert(last.content.includes('小明') && last.content.includes('戳了戳你'), JSON.stringify(last.content));
+      });
+      assert(actionsRun().includes('get_stranger_info'), '没查私聊戳人者昵称');
+      assert(actionsRun().includes('send_private_msg'), '没回复私聊戳一戳');
+    } finally {
+      config.private.debounceMs = originalDebounce;
+      memory.delete(peer);
+    }
+  });
+
+  sync('会话场景块：任何会话类型都带着长度上限', () => {
+    const group = sessionSurfaceBlock('g:1:2', { maxReplyChars: 66 });
+    assert(group.includes('66'), '群聊块没带上限：' + group);
+    const priv = sessionSurfaceBlock('u:2', { maxReplyChars: 33 });
+    assert(priv.includes('33'), '私聊块没带上限：' + priv);
+    // 认不出会话类型时也不能让「服从本会话上限」这条规则悬空
+    const odd = sessionSurfaceBlock('x:1', { maxReplyChars: 44 });
+    assert(odd.includes('44'), '兜底块没带上限：' + odd);
+    const noLimit = sessionSurfaceBlock('x:1', { maxReplyChars: 0 });
+    assert(noLimit.length > 0 && noLimit.includes('简短'), '没上限时也该给反话：' + noLimit);
+  });
+
+  await asyncTest('戳一戳：连着戳只算一次（同人冷却）', async () => {
+    const origDebounce = config.group.debounceMs;
+    config.group.debounceMs = 5;
+    const peer = 'g:9830:222222';
+    memory.delete(peer);
+    try {
+      mockOneBot();
+      await withPokeCfg(
+        { enabled: true, rateLimitPerMinute: 10, cooldownMs: 10000 },
+        () => withModelStub(async (bodies) => {
+          const poke = (n) =>
+            handlePayload(
+              JSON.stringify({
+                post_id: 'p' + n,
+                post_type: 'notice',
+                notice_type: 'notify',
+                sub_type: 'poke',
+                self_id: 999999,
+                group_id: 9830,
+                user_id: 222222,
+                target_id: 999999,
+              }),
+            );
+          poke(1);
+          await sleep(150);
+          poke(2);
+          poke(3);
+          await sleep(150);
+          assert(bodies.length === 1, '连戳应该只唤醒一次，实际 ' + bodies.length);
+        }),
+      );
+    } finally {
+      config.group.debounceMs = origDebounce;
+      memory.delete(peer);
+    }
+  });
+
+  await asyncTest('戳一戳：冷却拒绝不消耗每分钟限流额度', async () => {
+    const origDebounce = config.group.debounceMs;
+    config.group.debounceMs = 5;
+    const peer = 'g:9831:222222';
+    memory.delete(peer);
+    try {
+      mockOneBot();
+      await withPokeCfg(
+        { enabled: true, rateLimitPerMinute: 2, cooldownMs: 10000 },
+        () => withModelStub(async (bodies) => {
+          const poke = (n) =>
+            handlePayload(
+              JSON.stringify({
+                post_id: 'rate-poke-' + n,
+                post_type: 'notice',
+                notice_type: 'notify',
+                sub_type: 'poke',
+                self_id: 999999,
+                group_id: 9831,
+                user_id: 222222,
+                target_id: 999999,
+              }),
+            );
+          poke(1);
+          await sleep(150);
+          poke(2);
+          lastPokeAt.set(peer, Date.now() - 11000);
+          poke(3);
+          await sleep(150);
+          assert(bodies.length === 2, '冷却拒绝的戳占用了限流额度：模型调用 ' + bodies.length);
+          assert((rate.get('poke:' + peer) ?? []).length === 2, '限流桶计数不正确');
+        }),
+      );
+    } finally {
+      config.group.debounceMs = origDebounce;
+      memory.delete(peer);
+    }
+  });
+
+  sync('戳一戳配置走热加载值', () => {
+    const prev = liveCfg.poke;
+    liveCfg.poke = { enabled: false, rateLimitPerMinute: 7, cooldownMs: 1234 };
+    try {
+      const got = pokeCfg();
+      assert(got.enabled === false, '开关没热加载');
+      assert(got.rateLimitPerMinute === 7, '限流没热加载');
+      assert(got.cooldownMs === 1234, '冷却没热加载');
+    } finally {
+      liveCfg.poke = prev;
+    }
+  });
+
+  sync('戳一戳昵称缓存会过期，避免一直使用旧群名片', () => {
+    const key = 'g:ttl-test:1';
+    const now = Date.now();
+    try {
+      pokeNameCache.set(key, { nickname: '旧名字', at: now - POKE_NAME_TTL_MS - 1 });
+      assert(cachedPokeName(key, now) === '', '过期昵称仍被使用');
+      assert(!pokeNameCache.has(key), '过期昵称没被清掉');
+      pokeNameCache.set(key, { nickname: '新名字', at: now });
+      assert(cachedPokeName(key, now) === '新名字', '有效昵称没命中');
+    } finally {
+      pokeNameCache.delete(key);
+    }
+  });
+
+  await asyncTest('戳一戳和普通消息合并：正文不混入内部占位符', async () => {
+    mockOneBot();
+    const peer = 'g:9832:222222';
+    memory.delete(peer);
+    try {
+      const ctx = {
+        ...ctxFor('222222', '9832'),
+        nickname: '小明',
+        poke: { userId: '222222', nickname: '小明' },
+      };
+      await withModelStub(async (bodies) => {
+        await respond({
+          ctx,
+          texts: [POKE_EVENT_TEXT, '我最近在学吉他'],
+          items: [
+            { type: 'poke', text: POKE_EVENT_TEXT, nickname: '小明' },
+            { type: 'message', text: '我最近在学吉他', nickname: '' },
+          ],
+        });
+        assert(bodies.length === 1, '混合事件没调用模型');
+        const last = bodies[0].messages.at(-1);
+        assert(last.content === '小明：「我最近在学吉他」', JSON.stringify(last.content));
+        const systemText = bodies[0].messages
+          .filter((m) => m.role === 'system')
+          .map((m) => String(m.content))
+          .join('\n');
+        assert(systemText.includes('刚刚是 小明 戳了戳你'), '模型不知道同一轮里发生了戳一戳');
+      });
+    } finally {
+      memory.delete(peer);
+    }
+  });
+
+  sync('长期记忆：纯戳一戳被丢弃，戳+普通消息要保留', () => {
+    const day = '1999-12-25';
+    const file = join(LOG_DIR, 'bot-' + day + '.jsonl');
+    const rows = [
+      { ts: '1999-12-25T21:00:00Z', kind: 'incoming', peer: 'g:1:2', nickname: '小明', text: '（戳了戳你）', event: 'poke' },
+      { ts: '1999-12-25T21:00:02Z', kind: 'reply', peer: 'g:1:2', text: '你戳我干嘛', by: 'chat', model: true },
+      { ts: '1999-12-25T21:00:30Z', kind: 'incoming', peer: 'g:1:2', nickname: '小明', text: '我最近在学吉他', event: 'poke_message' },
+      { ts: '1999-12-25T21:00:32Z', kind: 'reply', peer: 'g:1:2', text: '学得怎么样', by: 'chat', model: true },
+      { ts: '1999-12-25T21:01:00Z', kind: 'incoming', peer: 'g:1:2', nickname: '小明', text: '你好' },
+      { ts: '1999-12-25T21:01:02Z', kind: 'reply', peer: 'g:1:2', text: '嗯', by: 'chat', model: true },
+    ];
+    writeFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n'), 'utf8');
+    try {
+      const lines = readDayDialogues(day).get('g:1:2') ?? [];
+      assert(lines.length === 4, '应该保留戳+消息后的两轮：' + JSON.stringify(lines));
+      assert(lines.some((l) => l.text.includes('吉他')), '戳+普通消息被整轮丢了：' + JSON.stringify(lines));
+      assert(!lines.some((l) => l.text.includes('你戳我干嘛')), '纯戳一戳回复混进语料了：' + JSON.stringify(lines));
+    } finally {
+      rmSync(file, { force: true });
+    }
+  });
 
   // ---- 本轮修的几个 bug ----------------
 
@@ -4415,15 +5002,30 @@ async function runSelfTest() {
     assert(sanitizePersonality('', 100) === '', '空输入应该是空');
   });
 
-  sync('system prompt = 生理设定 + 性格 + 硬规则', () => {
-    const prompt = buildSystemPrompt(config.group);
+  sync('system prompt = 生理设定 + 性格 + QQ 环境 + 硬规则；会话场景稳定', () => {
+    const prompt = buildSystemPrompt();
     assert(prompt.includes('蓝色大肥鱼'), '缺生理设定');
     assert(prompt.includes('硬性规则'), '缺硬规则');
+    assert(prompt.includes('你正在通过 QQ 和用户聊天'), '缺 QQ 交流环境');
+    assert(prompt.includes('QQ 消息段的文字占位'), '缺 QQ 消息格式说明');
     assert(prompt.includes('性格（只影响语气'), '没插入性格段');
     const personality = currentPersonality();
     if (personality) {
       assert(prompt.includes(personality.slice(0, 12)), '性格正文没进 prompt');
     }
+
+    const groupCfg = { ...config.group, maxReplyChars: 80 };
+    const privateCfg = { ...config.private, maxReplyChars: 200 };
+    const group = buildMessageList(groupCfg, 'g:surface-test:1', '在吗', [], []);
+    const privateChat = buildMessageList(privateCfg, 'u:surface-test', '在吗', [], []);
+    assert(group[0].content === privateChat[0].content, '共同 system prompt 不一致');
+    assert(group[1].role === 'system' && group[1].content.includes('QQ 群聊'), JSON.stringify(group[1]));
+    assert(group[1].content.includes('不超过 80 字'), '群聊长度上限没进场景块：' + group[1].content);
+    assert(
+      privateChat[1].role === 'system' && privateChat[1].content.includes('QQ 私聊'),
+      JSON.stringify(privateChat[1]),
+    );
+    assert(privateChat[1].content.includes('不超过 200 字'), '私聊长度上限没进场景块：' + privateChat[1].content);
   });
 
   await asyncTest('性格成长：按昨天的回复重写 → 截断 → 存档', async () => {
@@ -4785,7 +5387,7 @@ async function runSelfTest() {
       memory.delete('u:777');
       const list = buildMessageList(config.group, 'u:777', '你好', [], []);
       assert(list[0].role === 'system' && !String(list[0].content).includes('高数'), '第一条应该是人设');
-      assert(list[1].role === 'system' && String(list[1].content).includes('高数'), '画像没插在正确位置：' + JSON.stringify(list[1]));
+      assert(list[2].role === 'system' && String(list[2].content).includes('高数'), '画像没插在正确位置：' + JSON.stringify(list[2]));
     } finally {
       rmSync(memDir, { recursive: true, force: true });
       memDir = prevDir;
@@ -4995,7 +5597,8 @@ async function runSelfTest() {
 
       const msgs = bodies[0].messages;
       assert(msgs[0].role === 'system' && !String(msgs[0].content).includes('周五'), '第一条应该是人设');
-      assert(msgs[1].role === 'system' && String(msgs[1].content).includes('高数'), '画像没紧跟人设：' + JSON.stringify(msgs[1]));
+      assert(msgs[1].role === 'system' && String(msgs[1].content).includes('QQ 群聊'), '缺群聊场景：' + JSON.stringify(msgs[1]));
+      assert(msgs[2].role === 'system' && String(msgs[2].content).includes('高数'), '画像没紧跟会话场景：' + JSON.stringify(msgs[2]));
 
       const last = msgs[msgs.length - 1];
       assert(last.role === 'user', '最后一条应该是 user');

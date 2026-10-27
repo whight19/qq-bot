@@ -16,6 +16,11 @@
     "deniedReply": "",
     "disabledReply": "这个我办不了"
   },
+  "poke": {
+    "enabled": true,
+    "rateLimitPerMinute": 3,
+    "cooldownMs": 10000
+  },
   "private": {
     "enabled": true,
     "whitelistOnly": false,
