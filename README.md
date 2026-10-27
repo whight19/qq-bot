@@ -7,31 +7,40 @@ QQ 自动回复机器人：`bot.mjs`（OneBot v11）+ NapCat 后端 + DeepSeek �
 
 | 路径 | 说明 |
 | --- | --- |
-| `bot.mjs` | 机器人本体，Node 22+ 直接跑 |
+| `bot.mjs` | **入口**：`npm start`（= `node bot.mjs`）。运行状态、消息流程、指代打分、指令、性格成长都在这里 |
+| `src\paths.mjs` | 路径、环境变量、`config.json` 读取、启动时的致命检查 |
+| `src\log.mjs` | 运行日志：按天切文件，攒一批再落盘 |
+| `src\util.mjs` | 纯函数：时间/金额格式化、解析、文本收尾、打分用的纯计算 |
+| `src\longmem.mjs` | 长期记忆的纯计算：分词、稀有度、淡忘、画像渲染、提炼提示词 |
+| `package.json` | `npm start` / `npm test` / `npm run usage`（仍是零 npm 依赖） |
 | `config.json` | **本机私有，不进仓库**：放行规则、限流、人设、模型参数（从 `config.example.json` 复制） |
 | `config.example.json` | 配置模板：`onebot.token` 和 `admin.users` 留空 |
 | `.env` | **本机私有，不进仓库**：`DEEPSEEK_API_KEY`（必填）、`ONEBOT_WS`、`ONEBOT_TOKEN`（从 `.env.example` 复制） |
 | `.env.example` | 环境变量模板 |
 | `persona.md` | **生理设定**：身份、外形（固定不变，改完下一条消息生效） |
-| `persona-personality.md` | **性格**：说话方式、脾气（每天由模型自我总结一版） |
-| `assets\dict.txt` | 中文词表（jieba，MIT），长期记忆分词用；`data\dict.txt` 存在时优先用那个 |
+| `persona-personality.md` | **性格**：说话方式、脾气（每天由模型自我总结一版）。**本机私有，已忽略** —— 首次启动会自动从 `persona-personality.example.md` 复制一份 |
+| `persona-personality.example.md` | 性格模板（出厂默认），进仓库 |
+| `assets\dict.txt` | 中文词表（jieba，MIT），长期记忆分词用；放了 `data\dict.txt` 就用那份 |
 | `data\persona-history\` | 性格的历史版本，一天一个 `.md`，出问题可以照着回滚 |
 | `data\persona-state.json` | 性格上次哪天重写过（防止一天写多次） |
-| `logs\bot-YYYY-MM-DD.jsonl` | 运行日志，每行一条 JSON，自动按天切（**含真人聊天，已忽略**） |
+| `logs\bot-YYYY-MM-DD.jsonl` | 运行日志，每行一条 JSON，自动按天切；攒 8KB / 500ms 落盘一次（**含真人聊天，已忽略**） |
 | `data\history.json` | 每个会话的对话记忆（重启后接着聊，**已忽略**） |
 | `data\memory\` | 长期记忆：画像 + 事件（**含真人信息，已忽略**） |
 | `start-bot.cmd` | **一键启动**（双击即可） |
-| `restart-bot.cmd` | 重启机器人（改了 `bot.mjs` 之后用） |
+| `restart-bot.cmd` | 重启机器人（改了 `bot.mjs` / `src\` 之后用） |
 | `show-qrcode.cmd` | 单独把登录二维码画到窗口里 |
 | `napcat\shell\` | NapCat 后端（QQ 侧），**不进仓库**，见下 |
+
+> `bot.mjs` 和 `src\` 是一起的：只拷 `bot.mjs` 出去是跑不起来的（会报找不到模块）。
 
 ## 第一次运行（从源码开始）
 
 仓库里只有代码和默认配置，**不含任何密钥、QQ 号、聊天记录**。跑起来要自己填四样东西：
 
 ```powershell
-copy .env.example .env                    # 填 DEEPSEEK_API_KEY
-copy config.example.json config.json      # 填 onebot.token、admin.users
+copy .env.example .env                          # 填 DEEPSEEK_API_KEY
+copy config.example.json config.json            # 填 onebot.token、admin.users
+copy persona-personality.example.md persona-personality.md   # 可选：性格（不建也会自动生成）
 ```
 
 | 要填的 | 在哪 | 说明 |
@@ -42,6 +51,7 @@ copy config.example.json config.json      # 填 onebot.token、admin.users
 | `ignoreUsers` | `config.json` | 可选，不想理的号（比如其他机器人） |
 
 - **NapCat 不进仓库**（`napcat/` 已被忽略）：自己去 [NapCat 仓库](https://github.com/NapNeko/NapCatQQ) 下，把 OneBot WebSocket 开到 `127.0.0.1:3001`，token 填进 `config.json`；
+- **性格文件也不进仓库**：`persona-personality.md` 每天会被模型改写，属于运行数据。第一次启动时如果它不存在，会自动从 `persona-personality.example.md` 复制一份（日志 `personality_seeded`）；
 - 中文词表在 `assets/dict.txt`（jieba 词表，MIT），仓库自带；`data/dict.txt` 存在时优先用那个；
 - `data/`、`logs/` 是运行时数据（聊天记录、长期记忆、余额），已在 `.gitignore` 里，不会进仓库；
 - 需要 Node 22+（用了 `import`、`fetch`、`node:fs` 的现代 API）。
@@ -61,9 +71,11 @@ copy config.example.json config.json      # 填 onebot.token、admin.users
 手动启动等价于两步：
 
 1. 管理员运行 `napcat\shell\launcher.bat` → 等控制台出现 `OneBot11 适配器初始化完成`；
-2. `node bot.mjs`。
+2. `node bot.mjs`（等价于 `npm start`）。
 
 日志里出现 `{"kind":"ws_open"}` 和 `{"kind":"login",...}` 就通了。
+
+连上之后每 30 秒探一次活：连续 2 分钟没收到任何事件才去问一句 `get_status`，问不通（NapCat 假死但 TCP 没断）就主动断开重连，日志是 `ws_stale`；连不上时是 `ws_close`，URL 写错了是 `ws_open_failed`（不会让进程崩）。
 
 ## 人格：生理设定 + 会长的性格
 
@@ -141,13 +153,18 @@ persona.md（生理设定，固定）  +  persona-personality.md（性格，每�
 
 ```json
 "llm": {
+  "model": "deepseek-flash",  // 实际连的就是 flash，价目表也是按它写的
   "thinking": "disabled",     // 关键：思维模式开着时下面的采样参数全部无效
   "temperature": 1,
   "frequencyPenalty": 0.4,
   "presencePenalty": 0.3,
-  "maxTokens": 220
+  "maxTokens": 220,
+  "timeoutMs": 25000,
+  "retries": 1                // 429 / 5xx / 网络抖动重试几次；超时不重试
 }
 ```
+
+- **`retries`**（默认 1）：只对「值得重试」的失败重试 —— `429`、`5xx`、连不上；`4xx`（key 错、参数错）和**超时不重试**，因为那只会让你多等一倍。重试前会等 500ms/1s，日志是 `llm_retry`。联网搜索同样重试一次（`search_retry`）。
 
 - **`thinking: "disabled"`**：官方默认开启思维模式（effort=high），而思维模式**不支持 temperature / presence_penalty / frequency_penalty**（设置了不报错但无效），还会把 token 花在推理上、极端情况下 `content` 被截成空字符串。聊天场景关掉它，采样参数才真正起作用。
 - 关闭后实测输出 token 稳定在 8–19，回复延迟也降下来。
@@ -582,8 +599,9 @@ DeepSeek 的上下文缓存是**前缀缓存**：只有从第一个 token 开始
 - 法定假日识别不了，会按峰时算 —— 估出来的钱会偏高一点，属于保守估计；
 - 搜索只在「返回了非空结果」时计费（5 元 / 千次），失败、超时不算；
 - 统计口径是**整个机器人**（不是提问的人），分「今天」（本机日期切的那个日志文件）和「累计」（`logs\` 下所有日志）；
+- **按文件缓存**：每个日志文件解析一次就记住（按 size + mtime 判新旧），之后只有变过的那个文件（通常是今天）会重新解析 —— 跑一年也不会越问越慢；15 秒内的重复提问直接复用上次结果，改了单价会全部重算；
 - 每次模型调用只产生一条 `usage`（没有工具循环，管理员和普通人一样是一次请求）；
-- 不想开 QQ 也能看：`node D:\qq-bot\bot.mjs --usage`（同一个算法，直接打屏）。
+- 不想开 QQ 也能看：`node D:\qq-bot\bot.mjs --usage` 或 `npm run usage`（同一个算法，直接打屏）。
 
 ### 余额
 
@@ -671,10 +689,11 @@ DeepSeek 的上下文缓存是**前缀缓存**：只有从第一个 token 开始
 ### 自测
 
 ```bat
-node D:\qq-bot\bot.mjs --selftest
+npm test
+rem 等价于：node D:\qq-bot\bot.mjs --selftest
 ```
 
-用内存里的假 OneBot + 假模型接口跑 80 项断言：指令解析、句中 `/联网` 的抽取、显式指令的意图归属、重名拒绝、非管理员被拒、`/` 与 `@` 的两种触发规则（含「裸 `/联网` 分数不够不触发」）、随机插话（命中率 / 命中开口 / 没中不吭声 / 关掉不掷骰 / @ 别人不插嘴 / 触发消息不进 user 角色）、群聊 `user` 消息带说话人（私聊不加）、固定回复（群聊命中 / 私聊不生效 / 意图不符不走）、群上下文（首轮快照 / 之后增量 / 换话题重建 / 唤醒只带 10 条 / 没新消息不加块）、**transcript 只追加（下一次请求以上一次为前缀）**、裁剪预算（峰谷两套）、时间锚（月日/周几/时段）、长期记忆（分词 / 淡忘 / 准确时间 / 相对时间渲染 / 召回 / 新旧对账 / 别人说的话不算近况 / 画像位置 / 提炼管线 / 注入位置 / 去重与事实键 / 条数门槛 / 漏天补跑 / 语料只收调过模型的整轮）、性格成长（重写 → 截断 → 存档 / 快速迭代 / 关掉不触发 / 语料只收 chat）、撤回三种用法、通用指令、峰谷计价、余额增减，以及「管理员的聊天请求里没有任何 tools 字段」。不连 NapCat、不写记忆、不写日志（余额写在 `data\.selftest-balance.json`，跑完删掉）。改完代码先跑这个再重启。
+用内存里的假 OneBot + 假模型接口跑 91 项断言：指令解析、句中 `/联网` 的抽取、显式指令的意图归属、重名拒绝、非管理员被拒、`/` 与 `@` 的两种触发规则（含「裸 `/联网` 分数不够不触发」）、随机插话（命中率 / 命中开口 / 没中不吭声 / 关掉不掷骰 / @ 别人不插嘴 / 触发消息不进 user 角色）、群聊 `user` 消息带说话人（私聊不加）、固定回复（群聊命中 / 私聊不生效 / 意图不符不走）、群上下文（首轮快照 / 之后增量 / 换话题重建 / 唤醒只带 10 条 / 没新消息不加块）、**transcript 只追加（下一次请求以上一次为前缀）**、裁剪预算（峰谷两套）、时间锚（月日/周几/时段）、长期记忆（分词 / 淡忘 / 准确时间 / 相对时间渲染 / 召回 / 新旧对账 / 别人说的话不算近况 / 画像位置 / 提炼管线 / 注入位置 / 去重与事实键 / 条数门槛 / 漏天补跑 / 语料只收调过模型的整轮 / 记忆库 mtime 缓存）、性格成长（重写 → 截断 → 存档 / 快速迭代 / 关掉不触发 / 语料只收 chat / 首次运行从 example 复制）、撤回三种用法、通用指令、峰谷计价、余额增减、**同一会话不并发调模型**、连发合并后指令只认第一条、URL 里的 `/help` 不当指令、画像用绝对时间、pid 文件只删自己的、进程内缓存清扫、**429 重试 / 400 不重试**、`/用量` 按文件缓存，以及「管理员的聊天请求里没有任何 tools 字段」。不连 NapCat、不写记忆、不写日志（余额写在 `data\.selftest-balance.json`，跑完删掉）。改完代码先跑这个再重启。
 
 另外 `node bot.mjs --usage` 可以不启动机器人，直接按同样的算法把 token 消耗打出来。
 
@@ -718,7 +737,7 @@ node D:\qq-bot\bot.mjs --selftest
 
 - 按 **QQ 号**存「关于这个人」（称呼、喜好、习惯、近况、约定）和按 **群号**存「关于这个群」（群友怎么称呼、群里的梗、群规约定）；
 - 数据在 `data\memory\user-<QQ>.json` / `group-<群号>.json`，渲染好的画像在 `data\memory\profile-*.txt`；
-- 注入时**直接读那个 txt**，所以一天之内逐字不变 —— 这是它能被缓存命中的前提。别往里写「3 小时前」这种相对时间。
+- 注入时**直接读那个 txt**，所以一天之内逐字不变 —— 这是它能被缓存命中的前提。别往里写「3 小时前」这种相对时间：里面每条的时间是**绝对日期**（`10月26日 21:03`），不会因为隔了几天没聊天就变成假的「昨天」。
 
 **② 事件召回（每轮）**
 

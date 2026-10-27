@@ -1,0 +1,15 @@
+{
+  "name": "qq-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QQ 自动回复机器人：OneBot v11 (NapCat) + DeepSeek，零 npm 依赖",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bot.mjs",
+    "test": "node bot.mjs --selftest",
+    "usage": "node bot.mjs --usage"
+  }
+}

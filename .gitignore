@@ -8,6 +8,10 @@ logs/
 *.pid
 *.tmp
 
+# ---------- 性格：每天由模型改写，属于你的运行数据 ----------
+# 首次启动会自动从 persona-personality.example.md 复制一份
+persona-personality.md
+
 # ---------- 第三方大件：NapCat 本体请自行下载 ----------
 napcat/
 
