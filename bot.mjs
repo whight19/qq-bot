@@ -191,7 +191,7 @@ let lastInboundAt = Date.now(); // 最后一次收到任何 WS 帧的时间（�
 
 const pending = new Map(); // echo -> { resolve, reject, timer }
 const rate = new Map();    // bucketKey -> number[]
-const queues = new Map();  // peerKey -> { ctx, texts, timer }
+const queues = new Map();  // peerKey -> { ctx, items, timer }
 const busyPeers = new Set(); // peerKey -> 这一轮 respond 还在跑（同一会话不并发调模型）
 const lastTriggerAt = new Map(); // peerKey -> 上次被触发的时间
 const POKE_EVENT_TEXT = '（戳了戳你）';
@@ -1246,26 +1246,28 @@ function pokeNameKey(isGroup, groupId, userId) {
   return (isGroup ? 'g:' + groupId : 'u') + ':' + userId;
 }
 
-/** 缓存只负责低延迟展示；过期后后台刷新，避免群名片改了还一直叫旧名字。 */
+/**
+ * 缓存只负责低延迟展示。过期项仍可临时使用，调用方再后台刷新，
+ * 避免每隔一个 TTL 就突然退化成 QQ 号。
+ */
 function cachedPokeName(key, now = Date.now()) {
   const hit = pokeNameCache.get(key);
-  if (!hit) return '';
-  if (now - hit.at > POKE_NAME_TTL_MS) {
-    pokeNameCache.delete(key);
-    return '';
-  }
-  return hit.nickname;
+  if (!hit) return null;
+  return {
+    nickname: hit.nickname,
+    stale: now - hit.at > POKE_NAME_TTL_MS,
+  };
 }
 
 /** 群戳通常不带群名片/昵称，尽量补查一次；查不到就退回 QQ 号。 */
-async function pokeNickname(event, isGroup) {
+async function pokeNickname(event, isGroup, refresh = false) {
   const userId = toId(event.user_id || event.sender_id);
   const direct = String(event.sender?.card || event.sender?.nickname || '').trim();
   if (direct) return direct;
   const groupId = toId(event.group_id);
   const cacheKey = pokeNameKey(isGroup, groupId, userId);
-  const cached = cachedPokeName(cacheKey);
-  if (cached) return cached;
+  const previous = cachedPokeName(cacheKey);
+  if (previous && !refresh) return previous.nickname;
   try {
     const info = isGroup
       ? await callAction(
@@ -1288,7 +1290,7 @@ async function pokeNickname(event, isGroup) {
       error: String(err?.message || err),
     });
   }
-  return userId;
+  return previous?.nickname || userId;
 }
 
 /**
@@ -1367,9 +1369,11 @@ async function handlePokeEvent(event) {
   capMap(lastPokeAt);
 
   // ③ 昵称不挡回复：先用事件里带的（或缓存），查到了再补
-  const fast = String(event.sender?.card || event.sender?.nickname || '').trim()
-    || cachedPokeName(pokeNameKey(isGroup, groupId, userId))
-    || '';
+  const directName = String(event.sender?.card || event.sender?.nickname || '').trim();
+  const cacheKey = pokeNameKey(isGroup, groupId, userId);
+  const cached = cachedPokeName(cacheKey);
+  const fast = directName || cached?.nickname || '';
+  const needsRefresh = !directName && (!cached || cached.stale);
   const nickname = fast || userId;
   const ctx = {
     kind: isGroup ? 'group' : 'private',
@@ -1387,9 +1391,9 @@ async function handlePokeEvent(event) {
   log({ kind: 'poke', peer: peerKey, user: userId, nickname, group: groupId || null });
   enqueue(ctx, POKE_EVENT_TEXT, 'poke');
 
-  if (!fast) {
-    // 后台补名字：debounce 还没到点就能赶上这一轮，赶不上也不影响回复
-    pokeNickname(event, isGroup)
+  if (needsRefresh) {
+    // 后台补名字：无缓存时 QQ 号先顶上；缓存过期时旧昵称先顶上。
+    pokeNickname(event, isGroup, true)
       .then((name) => {
         if (!name || name === userId) return;
         const q = queues.get(peerKey);
@@ -3269,7 +3273,6 @@ function buildSystemPrompt() {
   ].join('\n');
 }
 
-/** 每个会话内保持不变的 QQ 场景说明，放在 transcript 前以保留前缀缓存。 */
 /**
  * 每个会话内保持不变的 QQ 场景说明，放在 transcript 前以保留前缀缓存。
  * 硬性规则 2 现在只说「服从本会话上限」，所以**这里必须永远给出一个上限** ——
@@ -4535,15 +4538,17 @@ async function runSelfTest() {
     }
   });
 
-  sync('戳一戳昵称缓存会过期，避免一直使用旧群名片', () => {
+  sync('戳一戳昵称缓存过期后仍可临时使用，并标记需要刷新', () => {
     const key = 'g:ttl-test:1';
     const now = Date.now();
     try {
       pokeNameCache.set(key, { nickname: '旧名字', at: now - POKE_NAME_TTL_MS - 1 });
-      assert(cachedPokeName(key, now) === '', '过期昵称仍被使用');
-      assert(!pokeNameCache.has(key), '过期昵称没被清掉');
+      const stale = cachedPokeName(key, now);
+      assert(stale?.nickname === '旧名字' && stale.stale === true, '过期昵称不能临时兜底');
+      assert(pokeNameCache.has(key), '过期昵称被提前删掉，无法 stale-while-revalidate');
       pokeNameCache.set(key, { nickname: '新名字', at: now });
-      assert(cachedPokeName(key, now) === '新名字', '有效昵称没命中');
+      const fresh = cachedPokeName(key, now);
+      assert(fresh?.nickname === '新名字' && fresh.stale === false, '有效昵称没命中');
     } finally {
       pokeNameCache.delete(key);
     }
