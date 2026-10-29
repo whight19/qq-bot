@@ -30,19 +30,25 @@ let logBuffer = '';
 let logBufferFile = '';
 let logFlushTimer = null;
 
+let dialogueBuffer = '';
+let dialogueBufferFile = '';
+let dialogueFlushTimer = null;
+
 function flushLog() {
   if (logFlushTimer) {
     clearTimeout(logFlushTimer);
     logFlushTimer = null;
   }
-  if (!logBuffer) return;
+  if (!logBuffer) return false;
   const text = logBuffer;
   const file = logBufferFile;
   logBuffer = '';
   try {
     appendFileSync(file, text);
+    return true;
   } catch {
     /* 日志写失败不影响主流程 */
+    return false;
   }
 }
 
@@ -68,4 +74,47 @@ function log(record) {
   }
 }
 
-export { log, flushLog, logFileName };
+function dialogueFileName(d) {
+  return logFileName(d).replace(/^bot-/, 'dialogue-');
+}
+
+function flushDialogueLog() {
+  if (dialogueFlushTimer) {
+    clearTimeout(dialogueFlushTimer);
+    dialogueFlushTimer = null;
+  }
+  if (!dialogueBuffer) return false;
+  const text = dialogueBuffer;
+  const file = dialogueBufferFile;
+  dialogueBuffer = '';
+  try {
+    appendFileSync(file, text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 只记录真正调用模型并成功发送的一轮对话，长期记忆优先读这个精简文件。 */
+function logDialogue(record) {
+  if (SELFTEST) return;
+  const now = new Date();
+  const file = join(LOG_DIR, dialogueFileName(now));
+  const line = JSON.stringify({ ts: now.toISOString(), kind: 'turn', ...record });
+  if (dialogueBuffer && dialogueBufferFile !== file) flushDialogueLog();
+  dialogueBufferFile = file;
+  dialogueBuffer += line + '\n';
+  if (dialogueBuffer.length >= LOG_FLUSH_CHARS) {
+    flushDialogueLog();
+    return;
+  }
+  if (!dialogueFlushTimer) {
+    dialogueFlushTimer = setTimeout(() => {
+      dialogueFlushTimer = null;
+      flushDialogueLog();
+    }, LOG_FLUSH_MS);
+    if (typeof dialogueFlushTimer.unref === 'function') dialogueFlushTimer.unref();
+  }
+}
+
+export { log, flushLog, logFileName, dialogueFileName, logDialogue, flushDialogueLog };

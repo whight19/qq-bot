@@ -20,7 +20,7 @@ import {
   ROOT, SELFTEST, config, API_KEY, BASE_URL, MODEL, WS_URL, withWsToken, wsUrlForLog, LOG_DIR,
   CONFIG_FILE, PID_FILE,
 } from './src/paths.mjs';
-import { log, flushLog, logFileName } from './src/log.mjs';
+import { log, flushLog, logFileName, dialogueFileName, logDialogue, flushDialogueLog } from './src/log.mjs';
 import {
   toId, allowed, sliceCurrentTopic, shouldSearch, stripSearchKeyword, buildWebContext,
   isCapabilityRefusal, tidyReply, cleanReplyText, sanitizePersonality, parseMinutes,
@@ -203,6 +203,20 @@ const POKE_EVENT_TEXT = '（戳了戳你）';
  * 从 OneBot 消息段中提取纯文本。
  * 同时识别「是否 @ 了机器人」「是否在引用某条消息」，并丢弃 CQ 码 / 图片等无法读懂的段。
  */
+function normalizeImageRef(data = {}) {
+  const rawUrl = String(data.url || '');
+  const rawFile = String(data.file || data.path || '');
+  const fileId = String(data.file_id || data.fileId || '');
+  const directUrl = /^https?:\/\//i.test(rawUrl)
+    ? rawUrl
+    : (/^https?:\/\//i.test(rawFile) ? rawFile : '');
+  return {
+    url: directUrl.replace(/&amp;/g, '&'),
+    file: rawFile.replace(/&amp;/g, '&'),
+    fileId: fileId.replace(/&amp;/g, '&'),
+  };
+}
+
 function extractText(message) {
   if (typeof message === 'string') {
     let atSelf = false;
@@ -216,9 +230,15 @@ function extractText(message) {
     const q = withoutAt.match(/\[CQ:reply,id=([^\],]+)/);
     if (q) replyId = toId(q[1]);
     const images = [];
-    for (const m of withoutAt.matchAll(/\[CQ:image,[^\]]*?(?:url|file)=([^,\]]+)/g)) {
-      const url = String(m[1] || '').replace(/&amp;/g, '&');
-      if (/^https?:\/\//i.test(url)) images.push(url);
+    for (const m of withoutAt.matchAll(/\[CQ:image,([^\]]*)\]/g)) {
+      const attrs = {};
+      for (const part of String(m[1] || '').split(',')) {
+        const i = part.indexOf('=');
+        if (i < 0) continue;
+        attrs[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+      }
+      const ref = normalizeImageRef(attrs);
+      if (ref.url || ref.file || ref.fileId) images.push(ref);
     }
     return {
       text: withoutAt.replace(/\[CQ:[^\]]*\]/g, '').replace(/\s+/g, ' ').trim(),
@@ -255,8 +275,8 @@ function extractText(message) {
         break;
       case 'image': {
         parts.push('[图片]');
-        const url = String(data.url || data.file || '');
-        if (/^https?:\/\//i.test(url)) images.push(url);
+        const ref = normalizeImageRef(data);
+        if (ref.url || ref.file || ref.fileId) images.push(ref);
         break;
       }
       case 'mface':
@@ -1435,7 +1455,15 @@ function handleMessageEvent(event) {
 
   // 图片单独记一份，识图时按「回看几张」取用
   if (images.length > 0) {
-    rememberImages(isGroup ? event.group_id : 'u:' + toId(event.user_id), images);
+  rememberImages(
+    isGroup ? event.group_id : 'u:' + toId(event.user_id),
+    images,
+    {
+      userId: toId(event.user_id),
+      messageId: toId(event.message_id),
+      at: Number(event.time) > 0 ? Number(event.time) * 1000 : Date.now(),
+    },
+  );
   }
 
   // 群里所有消息都记进缓冲（哪怕没 @ 它），@ 的时候才有上下文可看
@@ -1515,16 +1543,28 @@ function handleMessageEvent(event) {
         }
       }
       if (!respond) {
-        // 补丁：刚被触发过的 30 秒内，同一个人补发的纯图片也算数（「先说话后发图」）
+        // 补丁：刚被触发过的 followUpMs 内，同一个人补发的纯图片也算数（「先说话后发图」）
         const followUpMs = Math.max(0, Number(liveCfg.imageFollowUpMs ?? cfg.imageFollowUpMs ?? 30000));
         const pureImage = /^\s*(\[图片\]\s*)+$/.test(text) || text.trim() === '';
         const recentlyTriggered = Date.now() - (lastTriggerAt.get(peerKey) ?? 0) <= followUpMs;
+        const waitInFlight = awaitingImage.has(peerKey);
         // 这张图如果刚已经被上一轮回复用掉了，就别再回一遍
         const alreadyUsed = images.length > 0
-          && images.every((u) => Date.now() - (usedImageUrls.get(u) ?? 0) < 60000);
-        if (followUpMs > 0 && pureImage && images.length > 0 && recentlyTriggered && !alreadyUsed) {
+          && images.every((image) => Date.now() - (usedImageUrls.get(imageRefKey(image)) ?? 0) < 60000);
+        // 上一轮**已经成功看过图** → 这张是又一张新图，不是「补发」。
+        // 以前这里不管看没看到都补一轮，结果同一张图重发（同一内容、新 URL）会被答两遍。
+        const lastLook = lastVisionOutcome.get(peerKey);
+        const lookedRecently = lastLook?.outcome === 'success' && Date.now() - lastLook.at <= followUpMs;
+        if (
+          followUpMs > 0 && pureImage && images.length > 0
+          && recentlyTriggered && !alreadyUsed && !waitInFlight && !lookedRecently
+        ) {
           log({ kind: 'trigger', reason: 'image_followup', group: event.group_id, user: event.user_id, withinMs: followUpMs });
           respond = true;
+        } else if (waitInFlight) {
+          log({ kind: 'skip', reason: 'image_wait_inflight', group: event.group_id, user: event.user_id });
+        } else if (lookedRecently) {
+          log({ kind: 'skip', reason: 'image_already_looked', group: event.group_id, user: event.user_id });
         }
       }
       if (!respond) {
@@ -1938,6 +1978,7 @@ let memDir = join(ROOT, 'data', 'memory');
 let memStateFile = join(ROOT, 'data', 'memory-state.json');
 let memJobRunning = false;
 let memCheckedAt = 0;
+let memCompactedThisProcess = false;
 const memProfileCache = new Map();
 
 function longMemoryCfg() {
@@ -1951,11 +1992,16 @@ function longMemoryCfg() {
     enabled: raw.enabled !== false,
     hour: num(raw.hour, 4, 0, 23),
     maxScopes: num(raw.maxScopes, 6, 1, 20),
+    maxGroupScopes: num(raw.maxGroupScopes, 2, 1, 10),
+    concurrency: num(raw.concurrency, 2, 1, 4),
+    maxAttempts: num(raw.maxAttempts, 2, 1, 5),
     maxInputChars: num(raw.maxInputChars, 3000, 500, 8000),
     // 昨天至少说了这么多句（触发过机器人的）才值得提炼一次，太少的话提炼出来的都是废话
     minLines: num(raw.minLines, 10, 1, 200),
     // 最多往回补几天（关机 / 整天没人聊的日子）
     backfillDays: num(raw.backfillDays, 7, 1, 30),
+    maxStoredRecords: num(raw.maxStoredRecords, 500, MEM_MAX_RECORDS, 5000),
+    tombstoneDays: num(raw.tombstoneDays, 7, 0, 90),
   };
 }
 
@@ -2009,8 +2055,38 @@ function loadMemStore(kind, id) {
 function saveMemStore(kind, id, doc) {
   memFiles();
   const file = memStorePath(kind, id);
-  writeJsonAtomic(file, doc);
+  const saved = writeJsonAtomic(file, doc);
   memStoreCache.delete(file); // 下次读到的是刚写的这份
+  return saved;
+}
+
+function compactMemoryStores(cfg) {
+  if (memCompactedThisProcess) return;
+  memCompactedThisProcess = true;
+  let removed = 0;
+  let changed = 0;
+  try {
+    memFiles();
+    for (const name of readdirSync(memDir)) {
+      const match = /^(user|group)-(\d+)\.json$/.exec(name);
+      if (!match) continue;
+      const kind = match[1];
+      const id = match[2];
+      const file = memStorePath(kind, id);
+      const doc = readJsonSafe(file, null);
+      if (!doc || !Array.isArray(doc.records)) continue;
+      const result = compactMemoryRecords(doc, Date.now(), cfg);
+      if (result.removed <= 0) continue;
+      doc.at = Date.now();
+      if (saveMemStore(kind, id, doc)) {
+        removed += result.removed;
+        changed++;
+      }
+    }
+    log({ kind: 'memory_compacted', files: changed, removed });
+  } catch (err) {
+    log({ kind: 'memory_compact_failed', error: String(err?.message || err) });
+  }
 }
 
 /* ------------------------------- 分词（词表最大匹配） ------------------------------- */
@@ -2177,54 +2253,90 @@ function recallBlock(peerKey, query, recentText = '') {
 
 
 
-function mergeMemories(kind, id, items, now, eventDay) {
+/** 保留活跃记录和短期作废记录；旧的“永不删除”数据在这里压缩掉。 */
+function compactMemoryRecords(doc, now, cfg) {
+  const alive = [];
+  const dead = [];
+  for (const rec of doc.records) {
+    if (!rec) continue;
+    if (rec.已被取代) dead.push(rec);
+    else alive.push(rec);
+  }
+  const cutoff = now - cfg.tombstoneDays * 86400000;
+  const recentDead = dead
+    .filter((rec) => {
+      const t = Date.parse(rec.已被取代);
+      return Number.isFinite(t) && t >= cutoff;
+    })
+    .sort((a, b) => Date.parse(a.已被取代) - Date.parse(b.已被取代));
+  const deadBudget = Math.max(0, cfg.maxStoredRecords - alive.length);
+  doc.records = [...alive, ...recentDead.slice(-deadBudget)];
+  return { alive: alive.length, dead: doc.records.length - alive.length, removed: dead.length - (doc.records.length - alive.length) };
+}
+
+function mergeMemoryBatches(kind, id, batches, now, cfg = longMemoryCfg()) {
   const doc = loadMemStore(kind, id);
+  const tokenCache = new Map();
   let added = 0;
 
-  for (const it of Array.isArray(items) ? items : []) {
-    const text = String(it?.text ?? '').trim().slice(0, 80);
-    if (!text) continue;
-    const key = String(it?.事实键 ?? '').trim().slice(0, 20);
-    const importance = Math.max(0, Math.min(1, Number(it?.importance) || 0.5));
-    const tags = Array.isArray(it?.tags) ? it.tags.slice(0, 6).map(String) : [];
-    const tokens = memTokens(text);
+  for (const batch of batches) {
+    const eventDay = batch.eventDay;
+    const batchNow = Number(batch.now) || now;
+    for (const it of Array.isArray(batch.items) ? batch.items : []) {
+      const text = String(it?.text ?? '').trim().slice(0, 80);
+      if (!text) continue;
+      const key = String(it?.事实键 ?? '').trim().slice(0, 20);
+      const importance = Math.max(0, Math.min(1, Number(it?.importance) || 0.5));
+      const tags = Array.isArray(it?.tags) ? it.tags.slice(0, 6).map(String) : [];
+      const tokens = memTokens(text);
 
-    let handled = false;
-    for (const rec of doc.records) {
-      if (!rec || rec.已被取代) continue;
-      // 同一个事实键 = 同一件会变的事 → 旧的作废（留着可查，但不再注入）
-      if (key && rec.事实键 === key) {
-        rec.已被取代 = new Date(now).toISOString();
-        rec.replacedBy = text.slice(0, 40);
-        continue;
+      let handled = false;
+      for (const rec of doc.records) {
+        if (!rec || rec.已被取代) continue;
+        // 同一个事实键 = 同一件会变的事 → 旧的作废（保留短期墓碑用于排查）
+        if (key && rec.事实键 === key) {
+          rec.已被取代 = new Date(batchNow).toISOString();
+          rec.replacedBy = text.slice(0, 40);
+          continue;
+        }
+        let recTokens = tokenCache.get(rec.id);
+        if (!recTokens) {
+          recTokens = memTokens(rec.text);
+          tokenCache.set(rec.id, recTokens);
+        }
+        // 说的是同一件事 → 强化，不重复记
+        if (memSimilar(tokens, recTokens) >= MEM_SIMILAR) {
+          const A = memActivation(rec, batchNow);
+          rec.activation0 = Math.min(1, A + 0.2 * (1 - A));
+          rec.activationAnchor = new Date(batchNow).toISOString();
+          rec.reinforcedAt = new Date(batchNow).toISOString();
+          if (text.length > String(rec.text).length) {
+            rec.text = text;
+            tokenCache.set(rec.id, memTokens(text));
+          }
+          handled = true;
+          break;
+        }
       }
-      // 说的是同一件事 → 强化，不重复记
-      if (memSimilar(tokens, memTokens(rec.text)) >= MEM_SIMILAR) {
-        const A = memActivation(rec, now);
-        rec.activation0 = Math.min(1, A + 0.2 * (1 - A));
-        rec.activationAnchor = new Date(now).toISOString();
-        rec.reinforcedAt = new Date(now).toISOString();
-        if (text.length > String(rec.text).length) rec.text = text;
-        handled = true;
-        break;
-      }
+      if (handled) continue;
+
+      const record = {
+        id: 'm' + batchNow.toString(36) + Math.random().toString(36).slice(2, 5),
+        text,
+        // 优先用「对回日志那一行」的精确时间；没有就落到那天 12:00
+        at: it?.at && Number.isFinite(Date.parse(it.at)) ? it.at : memEventAt(eventDay, it?.time, batchNow),
+        importance,
+        tags,
+        ...(key ? { 事实键: key } : {}),
+      };
+      doc.records.push(record);
+      tokenCache.set(record.id, tokens);
+      added++;
     }
-    if (handled) continue;
-
-    doc.records.push({
-      id: 'm' + now.toString(36) + Math.random().toString(36).slice(2, 5),
-      text,
-      // 优先用「对回日志那一行」的精确时间（memTimeFor 算好的）；没有就落到那天 12:00
-      at: it?.at && Number.isFinite(Date.parse(it.at)) ? it.at : memEventAt(eventDay, it?.time, now),
-      importance,
-      tags,
-      ...(key ? { 事实键: key } : {}),
-    });
-    added++;
   }
 
-  // 太多就按「鲜活度 × 重要度」留前 N 条（不删，标作废）
-  const alive = doc.records.filter((r) => r && !r.已被取代);
+  // 活跃记录仍限制在 60 条；超出部分先标作废，再按墓碑期限/总上限压缩。
+  let alive = doc.records.filter((r) => !r.已被取代);
   if (alive.length > MEM_MAX_RECORDS) {
     const keep = new Set(
       alive
@@ -2241,10 +2353,15 @@ function mergeMemories(kind, id, items, now, eventDay) {
     }
   }
 
+  const compaction = compactMemoryRecords(doc, now, cfg);
   doc.at = now;
-  saveMemStore(kind, id, doc);
+  if (!saveMemStore(kind, id, doc)) throw new Error(`记忆库写入失败: ${kind}-${id}`);
   writeProfile(kind, id, renderProfile(kind, doc.records, now));
-  return added;
+  return { added, compaction };
+}
+
+function mergeMemories(kind, id, items, now, eventDay, cfg = longMemoryCfg()) {
+  return mergeMemoryBatches(kind, id, [{ items, eventDay, now }], now, cfg).added;
 }
 
 /** 把某一天的日志还原成「按会话分组的对话」，当提炼语料。 */
@@ -2262,6 +2379,35 @@ function readDayDialogues(day) {
   const pending = new Map(); // peer -> 还没配到回复的用户行
   const pokeTurn = new Set(); // 这一轮是戳一戳：连它后面那次 reply 一起丢掉
   let text = '';
+
+  // 新日期优先读精简对话日志；旧日志没有这个文件时继续用原来的解析器。
+  const dialogueFile = join(LOG_DIR, dialogueFileName(new Date(day + 'T12:00:00')));
+  if (existsSync(dialogueFile)) {
+    try {
+      const dialogueText = readFileSync(dialogueFile, 'utf8');
+      for (const line of dialogueText.split('\n')) {
+        if (!line) continue;
+        let rec;
+        try {
+          rec = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (rec.kind !== 'turn' || rec.event === 'poke' || !rec.peer) continue;
+        const user = String(rec.user ?? '').trim();
+        const assistant = String(rec.assistant ?? '').trim();
+        if (!user || !assistant) continue;
+        const lines = out.get(rec.peer) ?? [];
+        lines.push({ who: rec.nickname || '他', text: user.slice(0, 200), ts: rec.ts, model: true });
+        lines.push({ who: '我', text: assistant.slice(0, 200), ts: rec.ts, model: true });
+        out.set(rec.peer, lines);
+      }
+      return out;
+    } catch {
+      // 对话日志损坏时回退旧运行日志
+    }
+  }
+
   try {
     text = readFileSync(file, 'utf8');
   } catch {
@@ -2346,73 +2492,265 @@ async function extractMemories(kind, lines, cfg) {
  * 处理几天：days 从旧到新。一天一个日志，按会话分组后提炼。
  * 跑完把「处理过哪几天」合并进 state.processed —— 这样漏掉的天（关机、整天没人说话）下次能补。
  */
+const memoryScopeKey = (kind, id) => `${kind}:${id}`;
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function memoryDayState(state, day) {
+  const current = state.days?.[day];
+  const failed = current?.failed && typeof current.failed === 'object' ? current.failed : {};
+  const next = {
+    ...(current && typeof current === 'object' ? current : {}),
+    doneScopes: Array.isArray(current?.doneScopes) ? current.doneScopes : [],
+    failed,
+    skipped: Array.isArray(current?.skipped) ? current.skipped : [],
+    abandoned: Array.isArray(current?.abandoned) ? current.abandoned : [],
+    attempted: true,
+  };
+  delete next.deferred; // 旧版本字段，已改名 skipped；顺手清掉，别在状态文件里留垃圾
+  return next;
+}
+
+function persistMemoryState({ processed, days, scopeLastAt, stat }) {
+  const dayKeys = Object.keys(days).sort().slice(-30);
+  const recentDays = {};
+  for (const day of dayKeys) {
+    // 只留当前版本认识的字段；旧版的 deferred 之类不写回去
+    const { deferred, ...rest } = days[day] ?? {};
+    recentDays[day] = rest;
+  }
+  const recentProcessed = [...new Set(processed)].sort().slice(-30);
+  return writeJsonAtomic(memStateFile, {
+    version: 2,
+    at: new Date().toISOString(),
+    ...stat,
+    days: recentDays,
+    scopeLastAt,
+    processed: recentProcessed,
+  });
+}
+
+function memoryFailureCount(dayState, maxAttempts) {
+  return Object.values(dayState.failed ?? {}).filter((entry) => {
+    const attempts = Number(entry?.attempts) || 0;
+    return attempts < maxAttempts;
+  }).length;
+}
+
 async function runMemoryUpdate(days) {
   const cfg = longMemoryCfg();
   memJobRunning = true;
-  const stat = { days: days.length, users: 0, groups: 0, added: 0, failed: 0, processed: [] };
+  const stat = {
+    days: days.length,
+    scopes: 0,
+    calls: 0,
+    retried: 0,
+    users: 0,
+    groups: 0,
+    skipped: 0,
+    abandoned: 0,
+    changedScopes: 0,
+    added: 0,
+    failed: 0,
+    processed: [],
+  };
+
+  const raw = readJsonSafe(memStateFile, {}) ?? {};
+  const state = {
+    days: raw.days && typeof raw.days === 'object' ? { ...raw.days } : {},
+    scopeLastAt: raw.scopeLastAt && typeof raw.scopeLastAt === 'object' ? { ...raw.scopeLastAt } : {},
+  };
+  const processed = new Set(Array.isArray(raw.processed) ? raw.processed : []);
+  const tasks = [];
+
   try {
     for (const day of days) {
       const dialogues = readDayDialogues(day);
+      const dayState = memoryDayState(state, day);
+      state.days[day] = dayState;
+      const done = new Set(dayState.doneScopes);
       const now = Date.now();
 
-      // ① 每个人的个人库（一天说够 minLines 句才提，太少提不出东西）
-      const peers = [...dialogues.entries()]
-        .filter(([peer, lines]) => (peer.startsWith('g:') || peer.startsWith('u:')) && lines.length >= cfg.minLines)
-        .sort((a, b) => b[1].length - a[1].length)
-        .slice(0, cfg.maxScopes);
-      for (const [peer, lines] of peers) {
+      const candidateRank = (kind, id, lines) => {
+        const key = memoryScopeKey(kind, id);
+        const failure = dayState.failed[key];
+        const attempts = Number(failure?.attempts) || 0;
+        return {
+          kind,
+          id,
+          key,
+          lines,
+          day,
+          now,
+          attempts,
+          lastAt: Date.parse(state.scopeLastAt[key]) || 0,
+          done: done.has(key) || attempts >= cfg.maxAttempts,
+        };
+      };
+
+      const userCandidates = [];
+      for (const [peer, lines] of dialogues) {
+        if (!peer.startsWith('g:') && !peer.startsWith('u:')) continue;
+        if (lines.length < cfg.minLines) continue;
         const id = peer.startsWith('g:') ? peer.split(':')[2] : peer.slice(2);
         if (!id) continue;
-        try {
-          const items = await extractMemories('user', lines, cfg);
-          if (items.length) {
-            // 时间对回日志：每条记忆找它最像的那一行，用那一行的精确时刻
-            for (const it of items) it.at = memTimeFor(it.text, lines, day, now);
-            mergeMemories('user', id, items, now, day);
-            stat.users++;
-            stat.added += items.length;
-          }
-        } catch (err) {
-          stat.failed++;
-          log({ kind: 'memory_extract_failed', scope: 'user', id, day, error: String(err?.message || err) });
+        const candidate = candidateRank('user', id, lines);
+        if (candidate.done) {
+          if (candidate.attempts >= cfg.maxAttempts) dayState.abandoned = [...new Set([...dayState.abandoned, candidate.key])];
+          continue;
         }
+        userCandidates.push(candidate);
       }
+      userCandidates.sort((a, b) =>
+        b.attempts - a.attempts || a.lastAt - b.lastAt || b.lines.length - a.lines.length,
+      );
+      const selectedUsers = userCandidates.slice(0, cfg.maxScopes);
+      dayState.skipped = userCandidates.slice(cfg.maxScopes).map((x) => x.key);
+      tasks.push(...selectedUsers);
 
-      // ② 每个群的公共库（同一个群的所有对话合起来）
       const byGroup = new Map();
       for (const [peer, lines] of dialogues) {
         if (!peer.startsWith('g:')) continue;
         const gid = peer.split(':')[1];
         if (!gid) continue;
-        byGroup.set(gid, [...(byGroup.get(gid) ?? []), ...lines]);
+        if (!byGroup.has(gid)) byGroup.set(gid, []);
+        byGroup.get(gid).push(...lines);
       }
-      for (const [gid, lines] of [...byGroup.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 2)) {
+      const groupCandidates = [];
+      for (const [gid, lines] of byGroup) {
         if (lines.length < cfg.minLines) continue;
-        try {
-          const items = await extractMemories('group', lines, cfg);
-          if (items.length) {
-            for (const it of items) it.at = memTimeFor(it.text, lines, day, now);
-            mergeMemories('group', gid, items, now, day);
-            stat.groups++;
-            stat.added += items.length;
-          }
-        } catch (err) {
-          stat.failed++;
-          log({ kind: 'memory_extract_failed', scope: 'group', id: gid, day, error: String(err?.message || err) });
+        const candidate = candidateRank('group', gid, lines);
+        if (candidate.done) {
+          if (candidate.attempts >= cfg.maxAttempts) dayState.abandoned = [...new Set([...dayState.abandoned, candidate.key])];
+          continue;
         }
+        groupCandidates.push(candidate);
       }
+      groupCandidates.sort((a, b) =>
+        b.attempts - a.attempts || a.lastAt - b.lastAt || b.lines.length - a.lines.length,
+      );
+      const selectedGroups = groupCandidates.slice(0, cfg.maxGroupScopes);
+      dayState.skipped.push(...groupCandidates.slice(cfg.maxGroupScopes).map((x) => x.key));
+      dayState.skipped = [...new Set(dayState.skipped)];
+      tasks.push(...selectedGroups);
+    }
 
+    stat.scopes = tasks.length;
+    stat.retried = tasks.filter((task) => task.attempts > 0).length;
+    stat.skipped = Object.values(state.days).reduce((n, d) => n + (d.skipped?.length || 0), 0);
+
+    const extracted = await mapLimit(tasks, cfg.concurrency, async (task) => {
+      stat.calls++;
+      try {
+        const items = await extractMemories(task.kind, task.lines, cfg);
+        if (items.length) {
+          for (const item of items) item.at = memTimeFor(item.text, task.lines, task.day, task.now);
+        }
+        return { ...task, ok: true, items };
+      } catch (err) {
+        return { ...task, ok: false, error: String(err?.message || err) };
+      }
+    });
+
+    const stores = new Map();
+    for (const result of extracted) {
+      if (!result.ok) {
+        stat.failed++;
+        const dayState = state.days[result.day];
+        const previous = dayState.failed[result.key];
+        dayState.failed[result.key] = {
+          attempts: (Number(previous?.attempts) || 0) + 1,
+          lastAt: new Date().toISOString(),
+          error: result.error.slice(0, 200),
+        };
+        log({
+          kind: 'memory_extract_failed',
+          scope: result.kind,
+          id: result.id,
+          day: result.day,
+          attempt: dayState.failed[result.key].attempts,
+          error: result.error,
+        });
+        continue;
+      }
+      const storeKey = memoryScopeKey(result.kind, result.id);
+      let store = stores.get(storeKey);
+      if (!store) {
+        store = { kind: result.kind, id: result.id, tasks: [], batches: [] };
+        stores.set(storeKey, store);
+      }
+      store.tasks.push(result);
+      if (result.items.length > 0) {
+        store.batches.push({ items: result.items, eventDay: result.day, now: result.now });
+      }
+    }
+
+    for (const store of stores.values()) {
+      let added = 0;
+      try {
+        if (store.batches.length > 0) {
+          const merged = mergeMemoryBatches(store.kind, store.id, store.batches, Date.now(), cfg);
+          added = merged.added;
+        }
+        for (const task of store.tasks) {
+          const dayState = state.days[task.day];
+          dayState.doneScopes = [...new Set([...dayState.doneScopes, task.key])];
+          delete dayState.failed[task.key];
+          state.scopeLastAt[task.key] = new Date().toISOString();
+          if (task.kind === 'user' && task.items.length) stat.users++;
+          if (task.kind === 'group' && task.items.length) stat.groups++;
+        }
+        stat.added += added;
+        if (added > 0) stat.changedScopes++;
+        persistMemoryState({ processed, days: state.days, scopeLastAt: state.scopeLastAt, stat });
+      } catch (err) {
+        for (const task of store.tasks) {
+          const dayState = state.days[task.day];
+          const previous = dayState.failed[task.key];
+          dayState.failed[task.key] = {
+            attempts: (Number(previous?.attempts) || 0) + 1,
+            lastAt: new Date().toISOString(),
+            error: String(err?.message || err).slice(0, 200),
+          };
+          stat.failed++;
+        }
+        log({
+          kind: 'memory_merge_failed',
+          scope: store.kind,
+          id: store.id,
+          error: String(err?.message || err),
+        });
+        persistMemoryState({ processed, days: state.days, scopeLastAt: state.scopeLastAt, stat });
+      }
+    }
+
+    for (const day of days) {
       stat.processed.push(day);
+      const dayState = state.days[day];
+      const retryable = memoryFailureCount(dayState, cfg.maxAttempts);
+      if (retryable > 0) {
+        processed.delete(day);
+      } else {
+        processed.add(day);
+      }
+      stat.abandoned += dayState.abandoned?.length || 0;
     }
   } finally {
     memJobRunning = false;
   }
 
-  const prev = readJsonSafe(memStateFile, {}) ?? {};
-  const processed = [...new Set([...(Array.isArray(prev.processed) ? prev.processed : []), ...stat.processed])]
-    .sort()
-    .slice(-30);
-  writeJsonAtomic(memStateFile, { processed, at: new Date().toISOString(), ...stat });
+  persistMemoryState({ processed, days: state.days, scopeLastAt: state.scopeLastAt, stat });
   log({ kind: 'memory_update', ...stat });
 }
 
@@ -2439,6 +2777,7 @@ function maybeUpdateLongMemory() {
 
   const today = new Date();
   if (today.getHours() < cfg.hour) return;
+  compactMemoryStores(cfg);
 
   const state = readJsonSafe(memStateFile, {}) ?? {};
   const done = new Set(Array.isArray(state.processed) ? state.processed : []);
@@ -2513,6 +2852,7 @@ function ensureSingleInstance() {
 // 退出前先把日志缓冲落盘（appendFileSync 是同步的，exit 事件里可以写）。
 process.on('exit', () => {
   flushLog();
+  flushDialogueLog();
   clearPidFile();
 });
 
@@ -2602,7 +2942,10 @@ function resetUsageCache() {
 /** 读一遍日志算今天 + 累计；15 秒内复用结果，免得连续问时反复读盘。 */
 function readUsageStats() {
   const now = Date.now();
-  flushLog(); // 日志是攒着写的：先落盘，否则刚花的那几笔算不进去
+  // 日志是攒着写的：刚落盘的新记录必须让 15 秒总缓存失效，否则 /用量 会短暂漏账。
+  if (flushLog()) {
+    usageCache = { ...usageCache, at: 0, value: null };
+  }
   const price = usageCfg();
   const priceKey = JSON.stringify(price);
   if (usageCache.value && now - usageCache.at < 15000 && usageCache.priceKey === priceKey) {
@@ -3439,125 +3782,373 @@ async function askLLM(cfg, peerKey, userText, extraBlocks = [], imageParts = [],
 
 /* ---------------------------------------------------------------- 识图 */
 
-// 「要不要看图、回看几张」靠这几条规则判断（不调模型）
-const IMAGE_REF_RE = /(这张|那张|这图|那图|图里|图中|图片|截图|照片|看图|识图|认一下|这是啥|这是什么|啥东西|什么玩意|上面的图|刚才的图|发的图)/;
-const IMAGE_COUNT_RE = /([0-9]+|[一二两三四五六七八九十])\s*张/;
+// 「要不要看图、回看几张」先判断视觉意图，避免单提“图片/照片/几张”就误触发。
+const IMAGE_NOUN_RE = /(?:图|图片|照片|截图|画面|图像)/;
+const STRONG_IMAGE_DEICTIC_RE = /(?:(?:这张|那张)(?:图|图片|照片|截图)|这图|那图|图里|图中|上面的图|下面的图|刚才那张|刚发的?(?:图|照片|截图)|发的(?:图|照片|截图))/;
+const GENERIC_IMAGE_DEICTIC_RE = /(?:(?:这张|那张|上图|下图|刚才的图)|(?:这|那)(?:[0-9]+|[一二两三四五六七八九十])张)(?=\s*(?:$|[，,。.!！?？]|帮|给|看|认|识|是|啥|呢|哪|怎么))/;
+const IMAGE_VIEW_ACTION_RE = /(?:看看|看一下|瞧瞧|认一下|识别|识图|读一下|读读|翻译|是什么|啥东西|什么玩意|写了|写着|文字|内容|意思|哪张|哪个)/;
+const IMAGE_QUESTION_RE = /[?？]|(?:呢|在哪|怎么|什么|啥|哪张|哪个)/;
+const IMAGE_COUNT_RE = /([0-9]+|[一二两三四五六七八九十])\s*张\s*(?:图|图片|照片|截图|画面|图像)/;
+const LOOSE_IMAGE_COUNT_RE = /([0-9]+|[一二两三四五六七八九十])\s*张/;
+const IMAGE_META_RE = /(?:(?:怎么|如何|能不能|可不可以).{0,10}(?:发|上传|保存|压缩|设置|下载|获取|找|搜索).{0,10}(?:图|图片|照片|截图|图像)|(?:图|图片|照片|截图|图像).{0,8}(?:格式|尺寸|大小|怎么发|怎么上传|怎么保存|怎么下载|压缩|设置))/;
+const GROUP_IMAGE_SCOPE_RE = /(?:群里|群中|楼上|上面(?:这|那)张|上头那张|前面那张|别人发的|刚有人发|刚才发的图)/;
+const PURE_IMAGE_RE = /^\s*(?:\[图片\]\s*)+$/;
+const IMAGE_LEGACY_REF_RE = /(这张|那张|这图|那图|图里|图中|图片|截图|照片|看图|识图|认一下|这是啥|这是什么|啥东西|什么玩意|上面的图|刚才的图|发的图)/;
 const CN_NUM = { 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
 
-const imageLog = new Map(); // key -> [{ url, at }]，群按群号、私聊按会话键
-const usedImageUrls = new Map(); // url -> 最近一次被送给模型的时间
+let imageSeq = 0;
+const imageLog = new Map(); // key -> [{ id, url, file, fileId, at, userId, messageId, usedAt }]
+const usedImageUrls = new Map(); // imageRefKey -> 最近一次被送给模型的时间
+const failedImageRefs = new Map(); // imageRefKey -> { until, status, error }
+const awaitingImage = new Set(); // peerKey -> 当前回复正在等待补图
+// peerKey -> { outcome, at }：上一轮识图的结果，用来判断「补发图」到底是不是真的需要补
+const lastVisionOutcome = new Map();
 const IMAGE_LOG_LIMIT = 40;
 
 function visionCfg() {
   const cfg = liveCfg.vision && typeof liveCfg.vision === 'object' ? liveCfg.vision : (config.vision ?? {});
+  const num = (value, fallback, min, max) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  };
   return {
     enabled: cfg.enabled === true,
     detail: String(cfg.detail ?? 'low'),
-    defaultCount: Math.max(0, Number(cfg.defaultCount ?? 1)),
-    maxCount: Math.max(1, Number(cfg.maxCount ?? 3)),
-    maxAgeMinutes: Math.max(1, Number(cfg.maxAgeMinutes ?? 10)),
-    timeoutMs: Math.max(2000, Number(cfg.timeoutMs ?? 10000)),
-    maxBytes: Math.max(100_000, Number(cfg.maxBytes ?? 8_000_000)),
-    waitForImageMs: Math.max(0, Number(cfg.waitForImageMs ?? 4000)),
+    defaultCount: num(cfg.defaultCount, 1, 0, 10),
+    maxCount: num(cfg.maxCount, 3, 1, 10),
+    maxAgeMinutes: num(cfg.maxAgeMinutes, 10, 1, 1440),
+    timeoutMs: num(cfg.timeoutMs, 10000, 2000, 60000),
+    maxBytes: num(cfg.maxBytes, 8_000_000, 100_000, 50_000_000),
+    waitForImageMs: num(cfg.waitForImageMs, 4000, 0, 30000),
     missingImageReply: String(cfg.missingImageReply ?? '图呢？'),
+    downloadFailedReply: String(cfg.downloadFailedReply ?? '图没加载出来，再发一次'),
+    triggerMode: String(cfg.triggerMode ?? 'strict').toLowerCase() === 'balanced' ? 'balanced' : 'strict',
+    maxFetchAttempts: num(cfg.maxFetchAttempts, 1, 1, 3),
   };
 }
 
-function rememberImages(key, urls) {
-  if (!Array.isArray(urls) || urls.length === 0) return;
+function imageRefKey(image) {
+  if (typeof image === 'string') return image;
+  return String(image?.url || image?.fileId || image?.file || '');
+}
+
+function rememberImages(key, images, meta = {}) {
+  if (!Array.isArray(images) || images.length === 0) return;
   const k = toId(key);
   const list = imageLog.get(k) ?? [];
   const now = Date.now();
-  for (const url of urls) list.push({ url, at: now });
+  const rawAt = Number(meta.at);
+  const at = Number.isFinite(rawAt) && rawAt > 0 ? Math.min(rawAt, now) : now;
+  const seen = new Set();
+  for (const raw of images) {
+    const ref = typeof raw === 'string'
+      ? normalizeImageRef({ url: raw })
+      : normalizeImageRef(raw);
+    const refKey = imageRefKey(ref);
+    if (!refKey || seen.has(refKey)) continue;
+    seen.add(refKey);
+    list.push({
+      id: 'img' + ++imageSeq,
+      url: ref.url,
+      file: ref.file,
+      fileId: ref.fileId,
+      at,
+      userId: toId(meta.userId),
+      messageId: toId(meta.messageId),
+      usedAt: 0,
+    });
+  }
   const recent = list.filter((x) => now - x.at < 30 * 60000);
   while (recent.length > IMAGE_LOG_LIMIT) recent.shift();
   imageLog.set(k, recent);
 }
 
-/** 取最近的几张图（按时间正序返回，最老的在前）。 */
-function pickRecentImages(key, count, cfg) {
+/**
+ * 取最近的几张图。群聊默认只看当前说话人发的图；只有明确说“群里/楼上”
+ * 之类才允许跨发送者，避免 A 发的图被 B 的“这张图”误用。
+ */
+function pickRecentImages(key, count, cfg, options = {}) {
   const list = imageLog.get(toId(key)) ?? [];
   const cutoff = Date.now() - cfg.maxAgeMinutes * 60000;
-  return list.filter((x) => x.at >= cutoff).slice(-count);
+  let recent = list.filter((x) => x.at >= cutoff && imageRefKey(x));
+  if (options.userId && !options.allowOtherSenders) {
+    recent = recent.filter((x) => !x.userId || x.userId === toId(options.userId));
+  }
+  const byUrl = new Map();
+  for (const item of recent) {
+    const refKey = imageRefKey(item);
+    byUrl.delete(refKey);
+    byUrl.set(refKey, item);
+  }
+  return [...byUrl.values()].slice(-Math.max(1, count));
 }
 
 /**
- * 根据用户说的话决定要不要识图、回看几张：
- *   「这两张图 / 三张截图」→ 指定张数；
- *   「这图里是什么 / 看看刚才那张」→ defaultCount 张；
- *   没提图但这句本身带图且像提问 → 1 张；
- *   其它 → 0（不看图，省 token）。
+ * 判断视觉意图。strict 只认明确指代、看图动作、带视觉名词的数量或当前消息带图；
+ * balanced 才保留旧的宽松匹配。
  */
-function decideVisionLookback(text, hasCurrentImage, cfg) {
+function classifyVisionIntent(text, hasCurrentImage, cfg) {
   const t = String(text ?? '').trim();
+  const none = { want: 0, allowWait: false, rule: 'none' };
+  if (t && IMAGE_META_RE.test(t)) return none;
+
   const m = t.match(IMAGE_COUNT_RE);
   const explicit = m ? (CN_NUM[m[1]] ?? Number(m[1])) : null;
-  const ref = IMAGE_REF_RE.test(t);
-
   if (explicit && Number.isFinite(explicit) && explicit > 0) {
-    return Math.min(Math.max(1, explicit), cfg.maxCount);
+    return {
+      want: Math.min(Math.max(1, explicit), cfg.maxCount),
+      allowWait: true,
+      rule: 'count+visual-noun',
+    };
   }
-  if (ref) return Math.min(Math.max(1, cfg.defaultCount || 1), cfg.maxCount);
-  if (hasCurrentImage && /[?？]|什么|啥|哪|怎么|谁|多少/.test(t)) return 1;
-  if (hasCurrentImage && t === '') return 1;
-  return 0;
+
+  const strongDeictic = STRONG_IMAGE_DEICTIC_RE.test(t);
+  const genericDeictic = GENERIC_IMAGE_DEICTIC_RE.test(t);
+  const action = IMAGE_VIEW_ACTION_RE.test(t);
+  const noun = IMAGE_NOUN_RE.test(t);
+  if (action && noun) {
+    return {
+      want: Math.min(Math.max(1, cfg.defaultCount || 1), cfg.maxCount),
+      allowWait: true,
+      rule: 'view-action+image-noun',
+    };
+  }
+  if (strongDeictic && (action || IMAGE_QUESTION_RE.test(t))) {
+    return {
+      want: Math.min(Math.max(1, cfg.defaultCount || 1), cfg.maxCount),
+      allowWait: true,
+      rule: 'deictic+intent',
+    };
+  }
+  if ((strongDeictic || genericDeictic) && action) {
+    const loose = t.match(LOOSE_IMAGE_COUNT_RE);
+    const count = loose ? (CN_NUM[loose[1]] ?? Number(loose[1])) : null;
+    return {
+      want: Math.min(
+        Math.max(1, count && Number.isFinite(count) ? count : (cfg.defaultCount || 1)),
+        cfg.maxCount,
+      ),
+      allowWait: true,
+      rule: noun ? 'view-action+image-noun' : 'view-action+deictic',
+    };
+  }
+  if (hasCurrentImage) {
+    return {
+      want: Math.min(Math.max(1, cfg.defaultCount || 1), cfg.maxCount),
+      allowWait: false,
+      rule: 'current-image',
+    };
+  }
+  if (cfg.triggerMode === 'balanced' && IMAGE_LEGACY_REF_RE.test(t)) {
+    return {
+      want: Math.min(Math.max(1, cfg.defaultCount || 1), cfg.maxCount),
+      allowWait: true,
+      rule: 'balanced-legacy',
+    };
+  }
+  return none;
 }
 
-async function fetchImageAsDataUrl(url, cfg) {
+function imageMimeFromBuffer(buf, hinted = '') {
+  const hint = String(hinted || '').split(';')[0].trim().toLowerCase();
+  if (hint.startsWith('image/')) return hint;
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buf.length >= 6 && /^GIF8[79]a$/.test(buf.subarray(0, 6).toString('ascii'))) return 'image/gif';
+  if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
+  return '';
+}
+
+function imageFromBuffer(buf, cfg, mimeHint = '') {
+  if (buf.length > cfg.maxBytes) throw new Error('图片太大（' + buf.length + ' 字节）');
+  const mime = imageMimeFromBuffer(buf, mimeHint);
+  if (!mime) throw new Error('无法识别图片格式');
+  return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, bytes: buf.length, mime };
+}
+
+async function fetchImageAsDataUrl(url, cfg, signal = null) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
   try {
     const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) {
+      const err = new Error('HTTP ' + res.status);
+      err.status = res.status;
+      err.retryable = res.status === 429 || res.status >= 500;
+      throw err;
+    }
+    const contentLength = Number(res.headers?.get?.('content-length'));
+    if (Number.isFinite(contentLength) && contentLength > cfg.maxBytes) {
+      const err = new Error(`图片太大（${contentLength} 字节）`);
+      err.retryable = false;
+      throw err;
+    }
     const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > cfg.maxBytes) throw new Error('图片太大（' + buf.length + ' 字节）');
-    const mime = (res.headers.get('content-type') || '').split(';')[0].trim() || 'image/jpeg';
-    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, bytes: buf.length, mime };
+    return imageFromBuffer(buf, cfg, res.headers?.get?.('content-type') || '');
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
-/** 把最近的 N 张图抓下来，转成模型要的 image_url 内容块。 */
-async function buildImageParts(key, count, cfg) {
-  const picked = pickRecentImages(key, count, cfg);
+async function fetchImageFromOneBot(item, cfg) {
+  const file = item.file || item.fileId;
+  if (!file) return null;
+  const got = await callAction(
+    'get_image',
+    { file },
+    Math.min(cfg.timeoutMs, 8000),
+  );
+  if (!got || typeof got !== 'object') return null;
+  if (typeof got.base64 === 'string' && got.base64) {
+    const raw = got.base64.replace(/^data:[^;]+;base64,/, '');
+    return imageFromBuffer(Buffer.from(raw, 'base64'), cfg);
+  }
+  const local = String(got.file || '');
+  if (local && existsSync(local)) {
+    const size = statSync(local).size;
+    if (size > cfg.maxBytes) throw new Error(`图片太大（${size} 字节）`);
+    return imageFromBuffer(readFileSync(local), cfg);
+  }
+  const freshUrl = String(got.url || '');
+  if (/^https?:\/\//i.test(freshUrl) && freshUrl !== item.url) {
+    return fetchImageAsDataUrl(freshUrl, cfg);
+  }
+  return null;
+}
+
+async function fetchImageWithRetries(item, cfg) {
+  const refKey = imageRefKey(item);
+  const cachedFailure = failedImageRefs.get(refKey);
+  if (cachedFailure && cachedFailure.until > Date.now()) {
+    const err = new Error('近期下载失败，暂不重复请求');
+    err.status = cachedFailure.status;
+    err.cached = true;
+    err.retryable = false;
+    throw err;
+  }
+  let lastError = null;
+  let attempts = 0;
+  if (item.url) {
+    for (let attempt = 1; attempt <= cfg.maxFetchAttempts; attempt++) {
+      attempts++;
+      try {
+        const image = await fetchImageAsDataUrl(item.url, cfg);
+        failedImageRefs.delete(refKey);
+        return { image, attempts, source: 'url' };
+      } catch (err) {
+        lastError = err;
+        const aborted = err?.name === 'AbortError' || err?.code === 'ABORT_ERR';
+        const retryable = !aborted && (err?.retryable ?? (!err?.status || err.status === 429 || err.status >= 500));
+        if (!retryable || attempt >= cfg.maxFetchAttempts) break;
+        await sleep(200 * attempt);
+      }
+    }
+  }
+  try {
+    const fallback = await fetchImageFromOneBot(item, cfg);
+    if (fallback) {
+      failedImageRefs.delete(refKey);
+      return { image: fallback, attempts, source: 'get_image' };
+    }
+  } catch (err) {
+    if (!lastError) lastError = err;
+  }
+  const err = lastError ?? new Error('图片下载失败');
+  err.attempts = Math.max(1, attempts);
+  failedImageRefs.set(refKey, {
+    until: Date.now() + 60000,
+    status: Number(err.status) || 0,
+    error: String(err.message || err),
+  });
+  throw err;
+}
+
+/** 候选图片已经确定后只下载一次；4xx 不重试，网络/5xx 才按配置有限重试。 */
+async function buildImageParts(candidates, cfg) {
   const parts = [];
-  for (const item of picked) {
+  const failures = [];
+  for (const item of candidates) {
     try {
-      const img = await fetchImageAsDataUrl(item.url, cfg);
+      const fetched = await fetchImageWithRetries(item, cfg);
+      const img = fetched.image;
       parts.push({
         type: 'image_url',
         image_url: { url: img.dataUrl, detail: cfg.detail },
       });
-      usedImageUrls.set(item.url, Date.now()); // 记下这张已经用掉了
-      log({ kind: 'vision_image', bytes: img.bytes, mime: img.mime });
+      item.usedAt = Date.now();
+      usedImageUrls.set(imageRefKey(item), Date.now()); // 记下这张已经用掉了
+      log({
+        kind: 'vision_image',
+        image: item.id,
+        bytes: img.bytes,
+        mime: img.mime,
+        attempts: fetched.attempts,
+        source: fetched.source,
+      });
     } catch (err) {
+      const failure = {
+        image: item.id,
+        status: Number(err?.status) || 0,
+        error: String(err?.message || err),
+        attempts: Number(err?.attempts) || 1,
+      };
+      failures.push(failure);
       log({
         kind: 'vision_fetch_failed',
-        url: String(item.url).slice(0, 120),
-        error: String(err?.message || err),
+        ...failure,
       });
     }
   }
-  return parts;
+  return { parts, failures };
 }
 
 /**
- * 取图，并且允许「图还没到就先等一会儿」：
- * 常见场景是用户先把话发出去、一两秒后才把图发上来。
+ * 先确定候选，再下载。等待阶段只观察是否出现新图片，不反复抓已有 URL。
+ * 返回 missing / download_failed / partial / success，避免把下载失败说成“没发图”。
  */
-async function awaitImages(key, count, cfg) {
-  let parts = await buildImageParts(key, count, cfg);
+async function resolveVisionImages(key, { userId, count, cfg, allowWait, allowOtherSenders = false }) {
+  const startedAt = Date.now();
+  const options = { userId, allowOtherSenders };
+  let candidates = pickRecentImages(key, count, cfg, options);
   const waitMs = Math.max(0, Number(cfg.waitForImageMs ?? 0));
-  if (parts.length > 0 || waitMs <= 0) return parts;
-
-  const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 400));
-    parts = await buildImageParts(key, count, cfg);
-    if (parts.length > 0) break;
+  if (candidates.length === 0 && allowWait && waitMs > 0) {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      await sleep(250);
+      candidates = pickRecentImages(key, count, cfg, options);
+      if (candidates.length > 0) break;
+    }
   }
-  return parts;
+  const waitedMs = Date.now() - startedAt;
+  if (candidates.length === 0) {
+    return {
+      candidates: [],
+      parts: [],
+      failures: [],
+      waitedMs,
+      missing: true,
+      downloadFailed: false,
+      partial: false,
+    };
+  }
+
+  const { parts, failures } = await buildImageParts(candidates, cfg);
+  return {
+    candidates,
+    parts,
+    failures,
+    waitedMs,
+    missing: false,
+    downloadFailed: parts.length === 0,
+    partial: parts.length > 0 && failures.length > 0,
+  };
 }
 
 /**
@@ -3569,6 +4160,9 @@ function sweepCaches() {
   const now = Date.now();
   for (const [url, at] of usedImageUrls) {
     if (now - at > 10 * 60000) usedImageUrls.delete(url);
+  }
+  for (const [key, failure] of failedImageRefs) {
+    if (failure.until <= now) failedImageRefs.delete(key);
   }
   for (const [key, at] of lastTriggerAt) {
     if (now - at > 60 * 60000) lastTriggerAt.delete(key);
@@ -3713,6 +4307,7 @@ async function respond(queue) {
 
   const extraBlocks = [];
   let groupBlock = ''; // 只把群上下文写进 transcript（搜索结果/插话提示是临时的，不进历史）
+  const speaker = ctx.nickname || ctx.userId;
 
   // 时间锚：放最前面（背景信息），离当前消息远一点，不干扰指代
   if (config.llm?.nowLine !== false) extraBlocks.push(nowLine());
@@ -3737,8 +4332,8 @@ async function respond(queue) {
 
   if (ctx.kind === 'group') {
     try {
-      // 插话轮不剔除触发消息：让它作为「群里刚说的最后一条」留在上下文块里
-      const excludeCtx = ctx.bargedIn ? { userId: '', texts: [] } : { userId: ctx.userId, texts: messageTexts };
+      // 触发消息由下面独立的 system 块明确提供；群上下文只放它之前的内容，避免重复。
+      const excludeCtx = { userId: ctx.userId, texts: messageTexts };
       groupBlock = await buildGroupContext(ctx.peerKey, ctx.groupId, excludeCtx);
       if (groupBlock) extraBlocks.push(groupBlock);
     } catch (err) {
@@ -3806,15 +4401,14 @@ async function respond(queue) {
   //   群聊普通轮 → 带上说话人，模型才知道是谁在跟它说；
   //   随机插话   → 触发消息挪进上面的提示块（不是 user 角色），user 位置只留一句指令，
   //                否则模型会把它当成「有人对我提要求」，逐字硬答。
-  const speaker = ctx.nickname || ctx.userId;
   let promptUserText = textForModel;
   if (isPokeOnly) {
     promptUserText = speaker + ' 刚刚戳了戳你';
   } else if (ctx.bargedIn) {
-    // 插话轮：触发消息留在上面的上下文块里（不进 user 角色），user 只放一句指令，
-    // 否则模型会把它当成「有人对我提要求」，逐字硬答。
+    // 插话轮：明确给出触发消息和图片来源，不依赖可选的群上下文块。
     extraBlocks.push(
-      '（下面这些是群里别人在聊的，最后一条是刚说的，没有人叫你。' +
+      `（刚刚是 ${speaker} 在群里发了这条消息：「${textForModel}」。` +
+        '没有人直接叫你；如果这一轮附带图片，图片就来自这条消息。' +
         '你想接就接一句，别答成在回答他，也别问「怎么了」「有什么事」。）',
     );
     promptUserText = '（没人叫你，你自己看着接一句）';
@@ -3827,25 +4421,65 @@ async function respond(queue) {
   let imageParts = [];
   if (vCfg.enabled) {
     const currentImages = Array.isArray(ctx.images) ? ctx.images : [];
-    const want = decideVisionLookback(textForModel, currentImages.length > 0, vCfg);
-    if (want > 0) {
+    const intent = classifyVisionIntent(textForModel, currentImages.length > 0, vCfg);
+    if (intent.want > 0) {
       const key = ctx.kind === 'group' ? ctx.groupId : ctx.peerKey;
-      const startedAt = Date.now();
-      imageParts = await awaitImages(key, want, vCfg);
+      const allowOtherSenders = ctx.kind === 'group' && GROUP_IMAGE_SCOPE_RE.test(textForModel);
+      log({
+        kind: 'vision_decision',
+        peer: ctx.peerKey,
+        rule: intent.rule,
+        want: intent.want,
+        currentImage: currentImages.length > 0,
+        allowWait: intent.allowWait,
+        allowOtherSenders,
+      });
+      const waitingForNewImage = intent.allowWait && currentImages.length === 0;
+      if (waitingForNewImage) awaitingImage.add(ctx.peerKey);
+      let result;
+      try {
+        result = await resolveVisionImages(key, {
+          userId: ctx.userId,
+          count: intent.want,
+          cfg: vCfg,
+          allowWait: intent.allowWait,
+          allowOtherSenders,
+        });
+      } finally {
+        if (waitingForNewImage) awaitingImage.delete(ctx.peerKey);
+      }
+      imageParts = result.parts;
+      const outcome = result.missing
+        ? 'missing'
+        : (result.downloadFailed ? 'download_failed' : (result.partial ? 'partial' : 'success'));
+      // 记下这一轮识图的结果：后面判断「补发图要不要再答一轮」靠它
+      lastVisionOutcome.set(ctx.peerKey, { outcome, at: Date.now() });
+      capMap(lastVisionOutcome);
       log({
         kind: 'vision',
         peer: ctx.peerKey,
-        want,
+        rule: intent.rule,
+        want: intent.want,
+        candidates: result.candidates.length,
         got: imageParts.length,
-        waitedMs: Date.now() - startedAt,
+        failed: result.failures.length,
+        waitedMs: result.waitedMs,
+        outcome,
         detail: vCfg.detail,
       });
 
-      // 说了要看图，但等完还是没有图 —— 用固定回复顶回去，不再问模型
-      if (imageParts.length === 0) {
+      // 随机插话是可选行为，没人要求识图；图片缺失/下载失败时直接静默，
+      // 不能把“图没加载出来，再发一次”当成主动插话内容。
+      if (ctx.bargedIn && imageParts.length === 0) {
+        log({ kind: 'vision_random_skip', peer: ctx.peerKey, outcome });
+        return;
+      }
+
+      // “没收到图”和“收到了但下载失败”是两种状态，不能都回答「图呢？」。
+      if (result.missing) {
         const fallback = String(vCfg.missingImageReply ?? '').trim();
         if (fallback) {
-          log({ kind: 'vision_missing_image', peer: ctx.peerKey, want, reply: fallback });
+          log({ kind: 'vision_missing_image', peer: ctx.peerKey, want: intent.want, reply: fallback });
           try {
             rememberExchange(ctx.peerKey, promptUserText, fallback, Number(config.llm?.historyTurns ?? 8));
             await sendReply(ctx, fallback, 'builtin');
@@ -3854,8 +4488,44 @@ async function respond(queue) {
           }
           return;
         }
+        extraBlocks.push('（用户提到了图片，但目前没有收到可用图片；不要声称看过，可以自然请对方重发。）');
+      } else if (result.downloadFailed) {
+        const fallback = String(vCfg.downloadFailedReply ?? '').trim();
+        if (fallback) {
+          log({
+            kind: 'vision_download_failed',
+            peer: ctx.peerKey,
+            want: intent.want,
+            candidates: result.candidates.length,
+            failures: result.failures.length,
+            reply: fallback,
+          });
+          try {
+            rememberExchange(ctx.peerKey, promptUserText, fallback, Number(config.llm?.historyTurns ?? 8));
+            await sendReply(ctx, fallback, 'builtin');
+          } catch (err) {
+            log({ kind: 'send_error', peer: ctx.peerKey, error: String(err?.message || err) });
+          }
+          return;
+        }
+        extraBlocks.push('（图片已经收到，但下载或解析失败；不要声称看过图片，也不要让用户重新发送无关文本。）');
+      } else if (result.partial) {
+        log({
+          kind: 'vision_partial',
+          peer: ctx.peerKey,
+          want: intent.want,
+          got: imageParts.length,
+          failed: result.failures.length,
+        });
+        extraBlocks.push(`（你收到了 ${imageParts.length} 张图片，另有 ${result.failures.length} 张加载失败；不要声称看到了失败的那些。）`);
       }
     }
+  }
+
+  if (ctx.bargedIn && imageParts.length === 0) {
+    extraBlocks.push(
+      '（这一轮没有附带可查看的新图片；不要沿用历史中的图片失败回复，也不要声称“没看到图”。）',
+    );
   }
 
   // 没有工具：管理员和普通用户走同一条纯聊天路径，token 开销完全一样
@@ -3872,6 +4542,13 @@ async function respond(queue) {
     );
     if (reply) {
       await sendReply(ctx, reply);
+      logDialogue({
+        peer: ctx.peerKey,
+        nickname: ctx.nickname,
+        user: textForModel,
+        assistant: reply,
+        event: isPokeOnly ? 'poke' : (hasPoke ? 'poke_message' : 'message'),
+      });
       // 快速迭代模式：只数「真正聊出来的话」，指令回执/固定回复不算
       noteReplyForGrowth(reply);
     }
@@ -3972,6 +4649,11 @@ async function runSelfTest() {
             break;
           case 'get_stranger_info':
             data = { user_id: req.params.user_id, nickname: '小明' };
+            break;
+          case 'get_image':
+            data = {
+              base64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).toString('base64'),
+            };
             break;
           case 'send_group_msg':
             data = { message_id: 999 };
@@ -4337,6 +5019,39 @@ async function runSelfTest() {
       globalThis.fetch = originalFetch;
     }
   };
+  const withVisionAndModelStub = async (fn) => {
+    const originalFetch = globalThis.fetch;
+    const bodies = [];
+    let imageCalls = 0;
+    globalThis.fetch = async (url, init) => {
+      if (init?.method === 'POST') {
+        bodies.push(JSON.parse(init.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ choices: [{ message: { content: '嗯' } }] }),
+          text: async () => '',
+        };
+      }
+      imageCalls++;
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name) {
+            if (name === 'content-type') return 'image/jpeg';
+            return null;
+          },
+        },
+        arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
+      };
+    };
+    try {
+      await fn(bodies, () => imageCalls);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
   const withPokeCfg = async (cfg, fn) => {
     const prevConfig = config.poke;
     const prevLive = liveCfg.poke;
@@ -4551,6 +5266,262 @@ async function runSelfTest() {
       assert(fresh?.nickname === '新名字' && fresh.stale === false, '有效昵称没命中');
     } finally {
       pokeNameCache.delete(key);
+    }
+  });
+
+  sync('识图意图：只有明确视觉意图才触发', () => {
+    const cfg = visionCfg();
+    const want = (text, current = false) => classifyVisionIntent(text, current, cfg).want;
+    assert(want('这张图里是什么') === 1, '明确指代没触发');
+    assert(want('大肥鱼，看看图') === 1, '“看看图”没有等待识图');
+    assert(want('帮我看看这两张') === 2, '“这两张”没取到数量');
+    assert(want('三张截图分别是什么') === 3, '数量+视觉名词没触发');
+    assert(want('我买了三张票') === 0, '普通数量词误触发');
+    assert(want('看看这两张票') === 0, '“这两张票”被当成图片');
+    assert(want('这张牌怎么出') === 0, '“这张牌”被当成图片');
+    assert(want('怎么发图片') === 0, '发送方式被当成识图');
+    assert(want('图片格式是什么') === 0, '图片格式问题误触发');
+    assert(want('这张图怎么下载') === 0, '图片下载方法被当成识图');
+    assert(want('找一张猫图') === 0, '搜图请求误触发');
+    assert(want('这张呢') === 0, '无图时模糊指代误触发');
+    assert(want('', true) === 1, '当前消息带图却没触发');
+  });
+
+  sync('识图候选默认按发送者隔离', () => {
+    const key = 'vision-sender-test';
+    const cfg = { ...visionCfg(), maxAgeMinutes: 10 };
+    try {
+      rememberImages(key, ['https://example.invalid/a.jpg'], { userId: '1' });
+      rememberImages(key, ['https://example.invalid/b.jpg'], { userId: '2' });
+      const own = pickRecentImages(key, 1, cfg, { userId: '1' });
+      assert(own.length === 1 && own[0].url.endsWith('/a.jpg'), 'A 拿到了别人的图片');
+      const groupWide = pickRecentImages(key, 1, cfg, { userId: '1', allowOtherSenders: true });
+      assert(groupWide.length === 1 && groupWide[0].url.endsWith('/b.jpg'), '显式群图引用没取最新图片');
+    } finally {
+      imageLog.delete(key);
+    }
+  });
+
+  sync('识图指代包含“上面这张图”，并保留 OneBot file 元数据', () => {
+    assert(GROUP_IMAGE_SCOPE_RE.test('大肥鱼，看看上面这张图'), '“上面这张图”没算群图');
+    const parsed = extractText([
+      { type: 'image', data: { url: 'https://example.invalid/a.jpg', file: 'image-file-id', file_id: 'uuid-1' } },
+    ]);
+    assert(parsed.images.length === 1, '图片段没解析出来');
+    assert(parsed.images[0].url.endsWith('/a.jpg'), '图片 URL 丢失');
+    assert(parsed.images[0].file === 'image-file-id', '图片 file 丢失');
+    assert(parsed.images[0].fileId === 'uuid-1', '图片 file_id 丢失');
+  });
+
+  await asyncTest('识图：已有图片 HTTP 400 只尝试一次并标记下载失败', async () => {
+    const key = 'vision-http400-test';
+    const cfg = { ...visionCfg(), maxFetchAttempts: 1, waitForImageMs: 1000 };
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    try {
+      rememberImages(key, ['https://example.invalid/fail.jpg'], { userId: '1' });
+      globalThis.fetch = async () => {
+        calls++;
+        return { ok: false, status: 400 };
+      };
+      const result = await resolveVisionImages(key, {
+        userId: '1', count: 1, cfg, allowWait: true,
+      });
+      assert(calls === 1, '400 被重复下载：' + calls);
+      assert(result.missing === false, '已有图片被误判成没发图');
+      assert(result.downloadFailed === true, '下载失败状态没返回');
+      assert(result.parts.length === 0 && result.failures.length === 1, JSON.stringify(result));
+    } finally {
+      globalThis.fetch = originalFetch;
+      imageLog.delete(key);
+    }
+  });
+
+  await asyncTest('识图：HTTP 400 后使用 get_image 兜底重新解析', async () => {
+    const key = 'vision-onebot-fallback-test';
+    const url = 'https://example.invalid/stale.jpg';
+    const cfg = { ...visionCfg(), maxFetchAttempts: 1, waitForImageMs: 0 };
+    const originalFetch = globalThis.fetch;
+    try {
+      mockOneBot();
+      rememberImages(key, [{ url, file: 'image-file-token', fileId: 'uuid-token' }], { userId: '1' });
+      globalThis.fetch = async () => ({ ok: false, status: 400 });
+      const result = await resolveVisionImages(key, {
+        userId: '1', count: 1, cfg, allowWait: false,
+      });
+      assert(result.parts.length === 1, 'get_image 兜底没有取到图片');
+      assert(actionsRun().includes('get_image'), '没有调用 OneBot get_image');
+      assert(result.downloadFailed === false, JSON.stringify(result));
+    } finally {
+      globalThis.fetch = originalFetch;
+      imageLog.delete(key);
+      failedImageRefs.delete(url);
+      usedImageUrls.delete(url);
+    }
+  });
+
+  await asyncTest('识图：上一轮已经看过图，重发的图不再补答一轮', async () => {
+    mockOneBot();
+    const groupId = '9880';
+    const peer = 'g:9880:222222';
+    const originalDebounce = config.group.debounceMs;
+    config.group.debounceMs = 5;
+    lastTriggerAt.set(peer, Date.now());
+    lastVisionOutcome.set(peer, { outcome: 'success', at: Date.now() });
+    try {
+      await withModelStub(async (bodies) => {
+        handleMessageEvent({
+          post_type: 'message',
+          message_type: 'group',
+          self_id: 999999,
+          group_id: Number(groupId),
+          user_id: 222222,
+          message: [{ type: 'image', data: { url: 'https://example.invalid/again.jpg', file: 'file-again' } }],
+          sender: { nickname: '小明' },
+          time: Math.floor(Date.now() / 1000),
+        });
+        await sleep(120);
+        assert(bodies.length === 0, '上一轮刚看过图，又补答了一次：' + bodies.length);
+      });
+      assert(!queues.has(peer), '不该建队列');
+    } finally {
+      lastTriggerAt.delete(peer);
+      lastVisionOutcome.delete(peer);
+      imageLog.delete(groupId);
+      config.group.debounceMs = originalDebounce;
+    }
+  });
+
+  await asyncTest('识图：上一轮没看到图，补发的图仍然会答', async () => {
+    mockOneBot();
+    const groupId = '9881';
+    const peer = 'g:9881:222222';
+    const originalDebounce = config.group.debounceMs;
+    const originalVision = liveCfg.vision;
+    config.group.debounceMs = 5;
+    liveCfg.vision = { ...(config.vision ?? {}), enabled: true };
+    lastTriggerAt.set(peer, Date.now());
+    lastVisionOutcome.set(peer, { outcome: 'missing', at: Date.now() });
+    try {
+      await withModelStub(async (bodies) => {
+        handleMessageEvent({
+          post_type: 'message',
+          message_type: 'group',
+          self_id: 999999,
+          group_id: Number(groupId),
+          user_id: 222222,
+          message: [{ type: 'image', data: { url: 'https://example.invalid/late.jpg', file: 'file-late' } }],
+          sender: { nickname: '小明' },
+          time: Math.floor(Date.now() / 1000),
+        });
+        await sleep(150);
+        assert(bodies.length === 1, '上一轮没看到图，补发却没答：' + bodies.length);
+      });
+    } finally {
+      lastTriggerAt.delete(peer);
+      lastVisionOutcome.delete(peer);
+      imageLog.delete(groupId);
+      liveCfg.vision = originalVision;
+      config.group.debounceMs = originalDebounce;
+    }
+  });
+
+  await asyncTest('识图：等待图片期间不重复启动 image_followup', async () => {
+    mockOneBot();
+    const groupId = '9870';
+    const peer = 'g:9870:222222';
+    const originalDebounce = config.group.debounceMs;
+    config.group.debounceMs = 5;
+    awaitingImage.add(peer);
+    lastTriggerAt.set(peer, Date.now());
+    try {
+      handleMessageEvent({
+        post_type: 'message',
+        message_type: 'group',
+        self_id: 999999,
+        group_id: Number(groupId),
+        user_id: 222222,
+        message: [{ type: 'image', data: { url: 'https://example.invalid/wait.jpg', file: 'file-token' } }],
+        sender: { nickname: '小明' },
+        time: Math.floor(Date.now() / 1000),
+      });
+      await sleep(80);
+      assert(!queues.has(peer), '等待图片期间又创建了重复 follow-up 队列');
+    } finally {
+      awaitingImage.delete(peer);
+      lastTriggerAt.delete(peer);
+      imageLog.delete(groupId);
+      config.group.debounceMs = originalDebounce;
+    }
+  });
+
+  await asyncTest('识图：等待阶段只等新图，候选出现后只下载一次', async () => {
+    const key = 'vision-wait-test';
+    const cfg = {
+      ...visionCfg(),
+      maxFetchAttempts: 1,
+      waitForImageMs: 500,
+      maxAgeMinutes: 10,
+    };
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    try {
+      globalThis.fetch = async () => {
+        calls++;
+        return {
+          ok: true,
+          status: 200,
+          headers: {
+            get(name) {
+              if (name === 'content-type') return 'image/jpeg';
+              return null;
+            },
+          },
+          arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
+        };
+      };
+      const pending = resolveVisionImages(key, {
+        userId: '1', count: 1, cfg, allowWait: true,
+      });
+      await sleep(80);
+      rememberImages(key, ['https://example.invalid/later.jpg'], { userId: '1' });
+      const result = await pending;
+      assert(calls === 1, '等待补图后重复下载：' + calls);
+      assert(result.parts.length === 1 && result.missing === false, JSON.stringify(result));
+      assert(result.waitedMs >= 40, '没有实际等待新图：' + result.waitedMs);
+    } finally {
+      globalThis.fetch = originalFetch;
+      imageLog.delete(key);
+      usedImageUrls.delete('https://example.invalid/later.jpg');
+    }
+  });
+
+  await asyncTest('识图：下载失败回复独立文案，不误说“图呢”', async () => {
+    mockOneBot();
+    const key = '9850';
+    const peer = 'g:9850:222222';
+    const url = 'https://example.invalid/respond-fail.jpg';
+    const ctx = {
+      ...ctxFor('222222', '9850'),
+      nickname: '小明',
+      images: [url],
+    };
+    const originalFetch = globalThis.fetch;
+    try {
+      rememberImages(key, [url], { userId: '222222' });
+      globalThis.fetch = async () => ({ ok: false, status: 400 });
+      await respond({
+        ctx,
+        items: [{ type: 'message', text: '[图片]', nickname: '' }],
+      });
+      const reply = calls.find((c) => c.action === 'send_group_msg');
+      const text = reply?.params?.message?.[0]?.data?.text ?? '';
+      assert(text.includes('图没加载出来'), '下载失败回复不对：' + text);
+      assert(!text.includes('图呢'), '下载失败仍回复“图呢”');
+    } finally {
+      globalThis.fetch = originalFetch;
+      imageLog.delete(key);
+      memory.delete(peer);
     }
   });
 
@@ -4802,6 +5773,107 @@ async function runSelfTest() {
         sysTexts.some((c) => c.includes('给把枪') && c.includes('测试')),
         '提示块里没有触发消息或说话人',
       );
+      assert(
+        sysTexts.some((c) => c.includes('没有附带可查看的新图片')),
+        '随机插话没有防止模型沿用旧的图片失败上下文',
+      );
+    }),
+  );
+
+  await asyncTest('随机插话：群上下文关闭时，图片与文字来源仍绑定', () =>
+    withRandomSpeak({ enabled: true, avgMessages: 4 }, 0.1, async () => {
+      mockOneBot();
+      const originalContext = liveCfg.groupContext;
+      liveCfg.groupContext = { enabled: false };
+      const groupId = 9860;
+      const peer = 'g:9860:10002';
+      const url = 'https://example.invalid/random-with-text.jpg';
+      try {
+        await withVisionAndModelStub(async (bodies, imageCalls) => {
+          await fireGroupMessage(groupId, [
+            { type: 'text', data: { text: '看看这张图' } },
+            { type: 'image', data: { url } },
+          ]);
+          assert(bodies.length === 1, '带图插话没调用模型');
+          const body = bodies[0];
+          const systemText = body.messages
+            .filter((m) => m.role === 'system')
+            .map((m) => String(m.content))
+            .join('\n');
+          assert(systemText.includes('测试') && systemText.includes('看看这张图'), '触发消息或发送者丢失');
+          assert(systemText.includes('图片就来自这条消息'), '没说明图片来源');
+          const last = body.messages.at(-1);
+          assert(Array.isArray(last.content), '随机插话没有附带图片内容块');
+          assert(last.content.some((part) => part.type === 'image_url'), JSON.stringify(last.content));
+          assert(imageCalls() === 1, '随机插话图片下载次数异常：' + imageCalls());
+        });
+      } finally {
+        liveCfg.groupContext = originalContext;
+        imageLog.delete(String(groupId));
+        usedImageUrls.delete(url);
+        memory.delete(peer);
+      }
+    }),
+  );
+
+  await asyncTest('随机插话：纯图片也能看图，并能说明是谁发的', () =>
+    withRandomSpeak({ enabled: true, avgMessages: 4 }, 0.1, async () => {
+      mockOneBot();
+      const originalContext = liveCfg.groupContext;
+      liveCfg.groupContext = { enabled: false };
+      const groupId = 9861;
+      const peer = 'g:9861:10002';
+      const url = 'https://example.invalid/random-image-only.jpg';
+      try {
+        await withVisionAndModelStub(async (bodies, imageCalls) => {
+          await fireGroupMessage(groupId, [{ type: 'image', data: { url } }]);
+          assert(bodies.length === 1, '纯图随机插话没调用模型');
+          const body = bodies[0];
+          const systemText = body.messages
+            .filter((m) => m.role === 'system')
+            .map((m) => String(m.content))
+            .join('\n');
+          assert(systemText.includes('测试') && systemText.includes('[图片]'), '纯图来源丢失');
+          const last = body.messages.at(-1);
+          assert(
+            Array.isArray(last.content) && last.content.some((part) => part.type === 'image_url'),
+            '纯图没有附给随机插话模型',
+          );
+          assert(imageCalls() === 1, '纯图下载次数异常：' + imageCalls());
+        });
+      } finally {
+        liveCfg.groupContext = originalContext;
+        imageLog.delete(String(groupId));
+        usedImageUrls.delete(url);
+        memory.delete(peer);
+      }
+    }),
+  );
+
+  await asyncTest('随机插话：图片下载失败时静默，不发识图失败提示', () =>
+    withRandomSpeak({ enabled: true, avgMessages: 4 }, 0.1, async () => {
+      mockOneBot();
+      const originalContext = liveCfg.groupContext;
+      const originalFetch = globalThis.fetch;
+      liveCfg.groupContext = { enabled: false };
+      const groupId = 9862;
+      const peer = 'g:9862:10002';
+      const url = 'https://example.invalid/random-image-failed.jpg';
+      let imageCalls = 0;
+      try {
+        globalThis.fetch = async () => {
+          imageCalls++;
+          return { ok: false, status: 400 };
+        };
+        await fireGroupMessage(groupId, [{ type: 'image', data: { url } }]);
+        assert(imageCalls === 1, '图片下载次数异常：' + imageCalls);
+        assert(calls.length === 0, '随机插话在图片失败时仍发送了消息：' + actionsRun().join(','));
+      } finally {
+        globalThis.fetch = originalFetch;
+        liveCfg.groupContext = originalContext;
+        imageLog.delete(String(groupId));
+        memory.delete(peer);
+      }
     }),
   );
 
@@ -5423,6 +6495,147 @@ async function runSelfTest() {
     return base;
   };
 
+  await asyncTest('长期记忆：连续两批处理不会覆盖已处理日期', async () => {
+    const prevState = memStateFile;
+    memStateFile = join(ROOT, 'data', '.selftest-memory-state.json');
+    rmSync(memStateFile, { force: true });
+    try {
+      await runMemoryUpdate(['1999-12-20']);
+      await runMemoryUpdate(['1999-12-21']);
+      const state = readJsonSafe(memStateFile, {});
+      assert(
+        JSON.stringify(state.processed) === JSON.stringify(['1999-12-20', '1999-12-21']),
+        '后一批覆盖了前一批日期：' + JSON.stringify(state.processed),
+      );
+    } finally {
+      rmSync(memStateFile, { force: true });
+      memStateFile = prevState;
+    }
+  });
+
+  sync('长期记忆：作废记录会按期限和总上限压缩', () => {
+    const now = Date.now();
+    const cfg = { ...longMemoryCfg(), maxStoredRecords: 100, tombstoneDays: 7 };
+    const alive = Array.from({ length: 60 }, (_, i) => ({ id: 'a' + i, text: 'alive' + i }));
+    const recentDead = Array.from({ length: 200 }, (_, i) => ({
+      id: 'r' + i,
+      text: 'recent' + i,
+      已被取代: new Date(now - 3600000).toISOString(),
+    }));
+    const oldDead = Array.from({ length: 20 }, (_, i) => ({
+      id: 'o' + i,
+      text: 'old' + i,
+      已被取代: new Date(now - 30 * 86400000).toISOString(),
+    }));
+    const doc = { records: [...alive, ...recentDead, ...oldDead] };
+    const result = compactMemoryRecords(doc, now, cfg);
+    assert(result.alive === 60, '活跃记录数异常：' + result.alive);
+    assert(doc.records.length <= 100, '总记录未压缩：' + doc.records.length);
+    assert(doc.records.filter((r) => !r.已被取代).length === 60, '活跃记录被误删');
+    assert(!doc.records.some((r) => r.id.startsWith('o')), '过期墓碑没有清掉');
+  });
+
+  await asyncTest('长期记忆：失败范围只重试失败项，成功后整日才标记完成', async () => {
+    const prevState = memStateFile;
+    const prevCfg = config.longMemory;
+    memStateFile = join(ROOT, 'data', '.selftest-memory-state-retry.json');
+    config.longMemory = {
+      ...(prevCfg ?? {}),
+      minLines: 10,
+      maxScopes: 6,
+      maxGroupScopes: 2,
+      concurrency: 2,
+      maxAttempts: 2,
+      backfillDays: 7,
+    };
+    rmSync(memStateFile, { force: true });
+    const day = '1999-12-17';
+    const file = join(LOG_DIR, 'bot-' + day + '.jsonl');
+    const rows = [];
+    const base = new Date(day + 'T21:00:00').getTime();
+    for (const [userId, marker] of [['7001', '成功样本'], ['7002', '失败样本']]) {
+      for (let i = 0; i < 6; i++) {
+        rows.push({
+          ts: new Date(base + rows.length * 60000).toISOString(),
+          kind: 'incoming',
+          peer: 'u:' + userId,
+          nickname: '用户' + userId,
+          text: marker + '第' + i + '句',
+        });
+        rows.push({
+          ts: new Date(base + rows.length * 60000).toISOString(),
+          kind: 'reply',
+          peer: 'u:' + userId,
+          nickname: '我',
+          text: '回答' + i,
+          by: 'chat',
+          model: true,
+        });
+      }
+    }
+    writeFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n'), 'utf8');
+
+    const originalFetch = globalThis.fetch;
+    let phase = 1;
+    const calls = [];
+    globalThis.fetch = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      const text = JSON.stringify(body.messages);
+      calls.push(text);
+      if (phase === 1 && text.includes('失败样本')) throw new Error('forced memory failure');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: '[]' } }] }),
+        text: async () => '',
+      };
+    };
+    try {
+      await runMemoryUpdate([day]);
+      let state = readJsonSafe(memStateFile, {});
+      assert(!state.processed.includes(day), '部分失败仍把整日标记完成');
+      assert(
+        state.days?.[day]?.doneScopes?.length === 1,
+        '成功范围没有 checkpoint：' + JSON.stringify(state.days?.[day]),
+      );
+      assert(Object.keys(state.days?.[day]?.failed ?? {}).length === 1, '失败范围没有记录');
+
+      phase = 2;
+      calls.length = 0;
+      await runMemoryUpdate([day]);
+      state = readJsonSafe(memStateFile, {});
+      assert(state.processed.includes(day), '失败范围成功后仍未标记整日完成');
+      assert(calls.length === 1, '第二轮重复调用了已完成范围：' + calls.length);
+      assert(!calls[0].includes('成功样本'), '第二轮重跑了已成功范围');
+    } finally {
+      globalThis.fetch = originalFetch;
+      config.longMemory = prevCfg;
+      rmSync(file, { force: true });
+      rmSync(memStateFile, { force: true });
+      memStateFile = prevState;
+    }
+  });
+
+  sync('长期记忆：优先读取精简对话日志，并忽略纯戳轮次', () => {
+    const day = '1999-12-16';
+    const dialogueFile = join(LOG_DIR, dialogueFileName(new Date(day + 'T12:00:00')));
+    writeFileSync(
+      dialogueFile,
+      [
+        JSON.stringify({ ts: day + 'T21:00:00', kind: 'turn', peer: 'u:7001', nickname: '小明', user: '我喜欢白米饭', assistant: '记住了' }),
+        JSON.stringify({ ts: day + 'T21:01:00', kind: 'turn', peer: 'u:7001', nickname: '小明', user: '（戳了戳你）', assistant: '干嘛', event: 'poke' }),
+      ].join('\n'),
+      'utf8',
+    );
+    try {
+      const lines = readDayDialogues(day).get('u:7001') ?? [];
+      assert(lines.length === 2, '精简日志轮次解析错误：' + JSON.stringify(lines));
+      assert(lines[0].text === '我喜欢白米饭' && lines[1].text === '记住了', JSON.stringify(lines));
+    } finally {
+      rmSync(dialogueFile, { force: true });
+    }
+  });
+
   sync('时间锚：月日、周几、时刻、时段都对', () => {
     const s = nowLine(new Date('2026-10-27T03:32:00'));
     assert(s.includes('10月27日'), s);
@@ -5999,6 +7212,7 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
   log({ kind: 'uncaught_exception', error: String(err?.stack || err) });
   flushLog();
+  flushDialogueLog();
   try {
     saveMemoryNow();
   } catch {
@@ -6011,6 +7225,7 @@ process.on('SIGINT', () => {
   shuttingDown = true;
   saveMemoryNow();
   flushLog();
+  flushDialogueLog();
   clearPidFile();
   log({ kind: 'shutdown', memoryPeers: memory.size });
   flushLog();

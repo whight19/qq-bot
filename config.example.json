@@ -167,9 +167,14 @@
     "enabled": true,
     "hour": 4,
     "maxScopes": 6,
+    "maxGroupScopes": 2,
+    "concurrency": 2,
+    "maxAttempts": 2,
     "maxInputChars": 3000,
     "minLines": 10,
-    "backfillDays": 7
+    "backfillDays": 7,
+    "maxStoredRecords": 500,
+    "tombstoneDays": 7
   },
   "persona": "你是「蓝色大肥鱼」，DeepSeek 那只蓝鲸的拟人化：蓝色渐变长发、呆毛、鲸鱼鳍耳和大尾巴、深蓝白女仆装，手里端着一碗白米饭；说话短，语气偏平，自称「我」，贪吃、懒、傲娇。",
   "fallback": "我这边正忙，晚点回你哈。",
@@ -192,14 +197,17 @@
   },
   "vision": {
     "enabled": true,
+    "triggerMode": "strict",
     "detail": "low",
     "defaultCount": 1,
     "maxCount": 3,
     "maxAgeMinutes": 10,
     "timeoutMs": 10000,
     "maxBytes": 8000000,
-    "waitForImageMs": 4000,
-    "missingImageReply": "图呢？"
+    "waitForImageMs": 10000,
+    "maxFetchAttempts": 1,
+    "missingImageReply": "图呢？",
+    "downloadFailedReply": "图没加载出来，再发一次"
   },
   "logDir": "logs",
   "usage": {
